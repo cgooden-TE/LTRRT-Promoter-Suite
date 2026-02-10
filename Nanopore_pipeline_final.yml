@@ -1,0 +1,22 @@
+name: Nanopore_pipeline
+channels:
+  - conda-forge
+  - bioconda
+  - default
+  - defaults
+dependencies:
+  - bedtools
+  - cutadapt=4.2
+  - numpy
+  - pandas
+  - pychopper
+  - pysam
+  - python=3.10
+  - samtools
+  - minimap2=2.28
+  - ca-certificates
+  - openssl
+  - pyranges
+  - biopython
+  - pybedtools
+  - subread

@@ -1,0 +1,20 @@
+## GenomicAlignments and GenomicFeatures installed in R via BiocManager due to conda solver conflicts
+name: R-deseq2-env
+channels:
+  - conda-forge
+  - bioconda
+  - default
+  - defaults
+dependencies:
+  - r-base=4.2
+  - bioconductor-deseq2
+  - bioconductor-tximport
+  - r-tidyverse
+  - r-data.table
+  - r-devtools
+  - bioconductor-rsamtools
+  - bioconductor-genomicranges
+  - bioconductor-summarizedexperiment
+  - ca-certificates
+  - openssl
+prefix: /home/caleb/bin/miniforge-pypy3/envs/R-deseq2-env
