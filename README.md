@@ -24,30 +24,30 @@ mamba env create -f R-DESeq-env.yml
 mamba activate <env>
 ```
 
-#### AccuMap
-Minimum inputs: 
-    --fq, Input FASTQ of untrimmed, demultiplexed reads
-    --pyc, PyChopper output FASTQ filename
-    --sample, Sample name prefix (ex. Control_1)
-    --run_pyc, Runs PyChopper with default settings
-    --run_cut, Runs Cutadapt with default settings
-    --run_map, Runs Minimap2 with default settings
-    --ref, Reference genome. Ensure chromosome nomenclature is consistent. 
-    --kit, for ONT reads, default="PCB114"
+#### AccuMap\
+Minimum inputs:\
+    --fq, Input FASTQ of untrimmed, demultiplexed reads\
+    --pyc, PyChopper output FASTQ filename\
+    --sample, Sample name prefix (ex. Control_1)\
+    --run_pyc, Runs PyChopper with default settings\
+    --run_cut, Runs Cutadapt with default settings\
+    --run_map, Runs Minimap2 with default settings\
+    --ref, Reference genome. Ensure chromosome nomenclature is consistent.\
+    --kit, for ONT reads, default="PCB114"\
 
-Outputs (using provided sample name prefix):
-    - cutadapt.fastq : FASTQ after Cutadapt trimming
-    - cutadapt.log : Log file from Cutadapt run
-    - pychopped.fastq : Reads FASTQ after PyChopper primer removal
-    - pychopper.log : Log file from PyChopper run
-    - pychopper.report.pdf : PDF report from PyChopper
-    - pychopper.rescued.fastq : FASTQ of rescued reads from PyChopper
-    - minimap2.log : Log file from Minimap2 run
-    - minimap2.sam : SAM file from Minimap2 alignment
-    - strandtags.tsv : TSV file of read names and PyChopper strand orientations
-    - STtagged.bam : BAM file with PyChopper strand tags (ST) added
-    - STtagged.bed : BED file conversion of BAM with strand information
-    - STtagged.sorted.bam : Sorted BAM file with PyChopper strand tags
+Outputs (using provided sample name prefix):\
+    - cutadapt.fastq : FASTQ after Cutadapt trimming\
+    - cutadapt.log : Log file from Cutadapt run\
+    - pychopped.fastq : Reads FASTQ after PyChopper primer removal\
+    - pychopper.log : Log file from PyChopper run\
+    - pychopper.report.pdf : PDF report from PyChopper\
+    - pychopper.rescued.fastq : FASTQ of rescued reads from PyChopper\
+    - minimap2.log : Log file from Minimap2 run\
+    - minimap2.sam : SAM file from Minimap2 alignment\
+    - strandtags.tsv : TSV file of read names and PyChopper strand orientations\
+    - STtagged.bam : BAM file with PyChopper strand tags (ST) added\
+    - STtagged.bed : BED file conversion of BAM with strand information\
+    - STtagged.sorted.bam : Sorted BAM file with PyChopper strand tags\
 
 
 #### IsoClassifier 
