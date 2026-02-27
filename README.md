@@ -24,8 +24,8 @@ mamba env create -f R-DESeq-env.yml
 mamba activate <env>
 ```
 
-#### AccuMap\
-Minimum inputs:\
+#### AccuMap
+**Minimum inputs:**\
     --fq, Input FASTQ of untrimmed, demultiplexed reads\
     --pyc, PyChopper output FASTQ filename\
     --sample, Sample name prefix (ex. Control_1)\
@@ -35,7 +35,7 @@ Minimum inputs:\
     --ref, Reference genome. Ensure chromosome nomenclature is consistent.\
     --kit, for ONT reads, default="PCB114"\
 
-Outputs (using provided sample name prefix):\
+**Outputs (using provided sample name prefix):**\
     - cutadapt.fastq : FASTQ after Cutadapt trimming\
     - cutadapt.log : Log file from Cutadapt run\
     - pychopped.fastq : Reads FASTQ after PyChopper primer removal\
