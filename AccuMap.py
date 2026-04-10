@@ -18,11 +18,11 @@ Minimum inputs:
     --run_map, Run Minimap2
     --ref, Reference genome
     --kit, for ONT reads, default="PCB114"
+    --map_preset, for minimap2, default="splice"
 
 Outputs (using provided sample name prefix):
     - cutadapt.fastq : FASTQ after Cutadapt trimming
     - pychopped.fastq : FASTQ after PyChopper primer removal
-    - minimap2.sam : SAM file from Minimap2 alignment
     - strandtags.tsv : TSV file of read names and PyChopper strand orientations
     - STtagged.bam : BAM file with PyChopper strand tags (ST) added
     - STtagged.bed : BED file conversion of BAM with strand information
@@ -190,13 +190,27 @@ def run_cutadapt(fq_in, fq_out, log, a="A{15}", g="T{15}", t=16):
     command = f"cutadapt -j {t} -a \"{a}\" -g \"{g}\" -o {fq_out} --info-file {info_file} {fq_in}"
     run_command(command, log, step_name="Cutadapt", sample_name=os.path.basename(fq_in))
 
-## Minimap2 alignemnt with default settings unless specified by the user
-def run_minimap2(ref, fq, sam_out, log, t=24, sec="no", gap=20000):
+## Minimap2 alignment with default settings unless specified by the user
+def run_minimap2(ref, fq, bam_out, log, t=24, sec="no", gap=20000, preset="splice"):
+    # Build the preset/flags portion of the command
+    if preset == "none":
+        # No preset: user takes full control via other flags
+        ax_flags = "-a"
+    elif preset == "splice:hq":
+        # PacBio IsoSeq / HiFi reads
+        ax_flags = "-ax splice:hq"
+    else:
+        # ONT cDNA/dRNA default
+        ax_flags = f"-ax {preset} -uf -k14"
+
     command = (
-        f"minimap2 -ax splice -uf -k14 --secondary={sec} -G {gap} -t {t} {ref} {fq}"
-        f" | samtools view -b -o {bam_out} -"
+        f"minimap2 {ax_flags} --secondary={sec} -G {gap} -t {t} {ref} {fq}"
+        f" | samtools sort -o {bam_out} -"
     )
     run_command(command, log, step_name="Minimap2", sample_name=os.path.basename(fq))
+    # Index the sorted BAM
+    idx_command = f"samtools index {bam_out}"
+    run_command(idx_command, log, step_name="Index BAM", sample_name=os.path.basename(fq))
 
 ## Pychopper primer removal with default (multiplex) settings unless specified by the user
 def run_pychopper(fq_in, fq_out, unc, resc, report, log, kit="PCB114", t=8):
@@ -217,6 +231,11 @@ if __name__ == "__main__":
     parser.add_argument("--pyc_threads", type=int, default=8)
     parser.add_argument("--cut_threads", type=int, default=16)
     parser.add_argument("--map_threads", type=int, default=24)
+    parser.add_argument("--map_preset", default="splice",
+                        choices=["splice", "splice:hq", "none"],
+                        help="Minimap2 preset: 'splice' for ONT (default), "
+                             "'splice:hq' for PacBio IsoSeq/HiFi, "
+                             "'none' to omit preset")
     parser.add_argument("--map_sec", default="no")
     parser.add_argument("--map_gap", type=int, default=5000)
     args = parser.parse_args()
@@ -240,20 +259,30 @@ if __name__ == "__main__":
         current_fq = trim_out
 
     if args.run_map:
-        bam_out = f"{args.sample}.minimap2.bam"
+        bam_out = f"{args.sample}.minimap2.sorted.bam"
         log = f"{args.sample}.minimap2.log"
-        run_minimap2(args.ref, current_fq, bam_out, log, t=args.map_threads, sec=args.map_sec, gap=args.map_gap)
+        run_minimap2(args.ref, current_fq, bam_out, log, t=args.map_threads,
+                     sec=args.map_sec, gap=args.map_gap, preset=args.map_preset)
         args.bam = bam_out
 
-    tag_file = f"{args.sample}.strandtags.tsv"
-    have_tags = extract_pychopper_tags(args.pyc, tag_file)
-    tags = load_pychopper_tags(tag_file) if have_tags else {}
+    if args.run_pyc:
+        # PyChopper ran: extract ST tags, annotate, re-sort, index, and make BED
+        tag_file = f"{args.sample}.strandtags.tsv"
+        extract_pychopper_tags(args.pyc, tag_file)
+        tags = load_pychopper_tags(tag_file)
 
-    tagged = f"{args.sample}.STtagged.bam"
-    annotate_bam_with_strand(args.bam, tagged, tags)
+        tagged = f"{args.sample}.STtagged.bam"
+        annotate_bam_with_strand(args.bam, tagged, tags)
 
-    sorted_bam = f"{args.sample}.STtagged.sorted.bam"
-    sort_bam(tagged, sorted_bam)
+        sorted_bam = f"{args.sample}.STtagged.sorted.bam"
+        sort_bam(tagged, sorted_bam)
 
-    bed = f"{args.sample}.STtagged.bed"
-    bam_to_bed_with_strand(sorted_bam, bed)
+        idx_command = f"samtools index {sorted_bam}"
+        run_command(idx_command, f"{sorted_bam}.log", step_name="Index BAM", sample_name=args.sample)
+
+        bed = f"{args.sample}.STtagged.bed"
+        bam_to_bed_with_strand(sorted_bam, bed)
+    else:
+        # No PyChopper: skip ST tagging, produce BED directly from the mapped BAM
+        bed = f"{args.sample}.bed"
+        bam_to_bed_with_strand(args.bam, bed)
