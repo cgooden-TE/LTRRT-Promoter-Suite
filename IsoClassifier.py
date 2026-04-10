@@ -18,6 +18,7 @@ Example Usage:
         --gff annotations.gff \
         --bam sample1.bam sample2.bam \
         --min_mapq 30 \
+        --threads 4 \
         --output ltr_isoforms \
         --tss_out ltr_tss_summary.tsv \
         --gene_out gene_summary.tsv
@@ -25,6 +26,7 @@ Example Usage:
 import argparse
 import time
 from collections import Counter, defaultdict
+from multiprocessing import Pool
 import pandas as pd
 import pysam
 import numpy as np
@@ -40,6 +42,8 @@ def parse_args():
                         help='One or more BAM files')
     parser.add_argument('--min_mapq', type=int, default=30,
                         help='Minimum MAPQ for filtering reads')
+    parser.add_argument('--threads', type=int, default=1,
+                        help='Number of parallel processes for BAM classification (default: 1)')
     parser.add_argument('--output', required=True,
                         help='Output prefix for LTR TSV and summaries')
     parser.add_argument('--tss_out', required=True,
@@ -170,10 +174,15 @@ def infer_read_strand(read):
 
     # 2) minimap2 transcript strand
     if read.has_tag("ts"):
+        # For some PacBio alignments, minimap2 assumes the query is the coding strand
+        # and emits ts:A:+ statically, ignoring whether it mapped forward or reverse.
+        # We need to XOR it with the alignment orientation just like the ST tag.
         ts = read.get_tag("ts")
-        # pysam usually returns '+' or '-' for ts:A:+ / ts:A:-
         if ts in {"+", "-"}:
-            return ts
+            if read.is_reverse:
+                return "-" if ts == "+" else "+"
+            else:
+                return ts
 
     # 3) XS tag (common in some spliced alignments)
     if read.has_tag("XS"):
@@ -215,39 +224,9 @@ def infer_read_strand(read):
         return "-" if read.is_reverse else "+"
     except Exception:
         return "."
+    return "."
 
-# Get the strand for element by aggregating read evidence across all BAMs, only for those without a valid strand in the GFF.
-def infer_element_strands(elem_info, full_tree, bam_paths, min_mapq):
-    # only track those without a valid '+' or '-'
-    to_infer = {
-        eid: {'+': 0, '-': 0}
-        for eid, e in elem_info.items()
-        if e.get('strand') not in ('+','-')
-    }
-
-    for path in bam_paths:
-        bf = pysam.AlignmentFile(path, 'rb')
-        for read in bf.fetch(until_eof=True):
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
-            if read.mapping_quality < min_mapq:
-                continue
-            strand = infer_read_strand(read)
-            if strand not in ("+", "-"):
-                continue  # optional: skip unknowns instead of forcing them
-
-            origin = read.reference_start if strand == '+' else read.reference_end - 1
-            chrom  = bf.get_reference_name(read.reference_id)
-
-            # for each element overlapping this read-origin
-            for iv in full_tree[chrom].at(origin):
-                eid = iv.data
-                if eid in to_infer:
-                    to_infer[eid][strand] += 1
-
-    # assign the majority
-    for eid, counts in to_infer.items():
-        elem_info[eid]['strand'] = '+' if counts['+'] >= counts['-'] else '-'
+# (infer_element_strands removed – integrated into multiprocessing pass)
         
 # Collects soft clipping data from 3' ends
 def softclip_3prime(read):
@@ -353,52 +332,92 @@ def exon_intron_row_fields(read, min_intron_len=69, max_exons=5, length_mode="qu
 
     return ex_n, in_n, ex_total, in_total, fields, saw_real
 
-# Reads in multiple bam files if desired, aggregates all reads overlapping each element, 
-# and classifies into categories based on start/end positions relative to LTRs and splicing patterns.
-def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_info,
-                           gene_tree, bam_paths, min_mapq, clip_out_splice=None, clip_out_nonsplice=None,
-                           ltr_exon_out=None, gene_exon_out=None):
+# ---------------------------------------------------------------------------
+# Per-chromosome worker for multiprocessing
+# ---------------------------------------------------------------------------
+_CATS = ['ltr_left','ltr_right','spanning','ro5','ro3',
+         'spliced_ltr_left','spliced_ltr_right']
+
+# Global variables for worker inheritance (Zero-copy on Linux via fork)
+_GLOBAL_ELEM_INFO = {}
+_GLOBAL_GENE_INFO = {}
+_GLOBAL_FULL_TREE = {}
+_GLOBAL_NESTED_TREE = {}
+_GLOBAL_GENE_TREE = {}
+
+def init_worker(elem_info, gene_info, full_tree, nested_tree, gene_tree):
+    """Initializer to populate globals for spawned workers (Windows/Mac)"""
+    global _GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, _GLOBAL_FULL_TREE
+    global _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE
+    _GLOBAL_ELEM_INFO = elem_info
+    _GLOBAL_GENE_INFO = gene_info
+    _GLOBAL_FULL_TREE = full_tree
+    _GLOBAL_NESTED_TREE = nested_tree
+    _GLOBAL_GENE_TREE = gene_tree
+
+def _classify_chrom(chrom, bam_paths, min_mapq):
+    """Process all primary reads on *chrom* across every BAM."""
+    
+    # Access the massive data structures directly from global memory (zero pickling overhead)
+    elem_info = _GLOBAL_ELEM_INFO
+    gene_info = _GLOBAL_GENE_INFO
+    full_tree_chrom = _GLOBAL_FULL_TREE.get(chrom, None)
+    nested_tree_chrom = _GLOBAL_NESTED_TREE.get(chrom, None)
+    gene_tree_chrom = _GLOBAL_GENE_TREE.get(chrom, None)
+    
+    # Fast path: if this chromosome has strictly zero trees in the GFF, skip entirely.
+    if not full_tree_chrom and not nested_tree_chrom and not gene_tree_chrom:
+        return {
+            'chrom': chrom, 'strand_counts': Counter(), 'stats': {},
+            'gene_stats': {}, 'gene_tss': {}, 'tss_positions': {}, 'end_positions': {},
+            'clip_rows_splice': [], 'clip_rows_nonsplice': [],
+            'ltr_exon_rows': [], 'gene_exon_rows': [], 'infer_votes': {}
+        }
+        
+    t0 = time.time()
+    n_reads = 0
     strand_counts = Counter()
-    cats = ['ltr_left','ltr_right','spanning','ro5','ro3', 'spliced_ltr_left','spliced_ltr_right']
 
-    stats = {eid: {'total':0,
-                   'counts':{c:0 for c in cats},
-                   'lengths':{c:0 for c in cats},
-                   'spliced':{c:0 for c in cats},
-                   'junctions':{c:set() for c in cats},
-                   'strands':{c:[] for c in cats}}
-             for eid in elem_info}
+    # local accumulators -----------------------------------------------
+    stats = {}            # eid -> per-element stats
+    gene_stats = {}       # gid -> {'total': int}
+    gene_tss = {}         # gid -> [int, ...]
+    tss_positions = {}    # eid -> {cat: [int, ...]}
+    end_positions = {}    # eid -> {cat: [int, ...]}
 
-    gene_stats = {gid:{'total':0} for gid in gene_info}
-    gene_tss = {gid:[] for gid in gene_info}
-    tss_positions = {eid: {c: [] for c in cats} for eid in elem_info}
-    end_positions = {eid: {c: [] for c in cats} for eid in elem_info}
-
-    # Store per-read clipping records
     clip_rows_splice = []
     clip_rows_nonsplice = []
     ltr_exon_rows = []
     gene_exon_rows = []
+    infer_votes = {}
 
-    total_reads = sum(
-        sum(s.mapped for s in pysam.AlignmentFile(p,'rb').get_index_statistics())
-        for p in bam_paths
-    )
-    print(f"Total reads across {len(bam_paths)} BAMs: {total_reads}")
-    print("Filtering reads originating in nested features...")
+    def _ensure_eid(eid):
+        if eid not in stats:
+            stats[eid] = {'total': 0,
+                          'counts': {c: 0 for c in _CATS},
+                          'lengths': {c: 0 for c in _CATS},
+                          'spliced': {c: 0 for c in _CATS},
+                          'junctions': {c: set() for c in _CATS},
+                          'strands': {c: [] for c in _CATS}}
+            tss_positions[eid] = {c: [] for c in _CATS}
+            end_positions[eid] = {c: [] for c in _CATS}
 
-    processed, start_time = 0, time.time()
-    interval = max(total_reads//10, 10000)
+    def _ensure_gid(gid):
+        if gid not in gene_stats:
+            gene_stats[gid] = {'total': 0}
+            gene_tss[gid] = []
 
     for path in bam_paths:
-        print(f"Processing {path}...")
-        bf = pysam.AlignmentFile(path,'rb')
-        for read in bf.fetch(until_eof=True):
-            processed += 1
-            if processed % interval == 0:
-                elapsed = time.time() - start_time
-                est = elapsed / processed * total_reads
-                print(f"{processed}/{total_reads} reads; elapsed {elapsed:.1f}s; ~{(est-elapsed)/60:.1f}m remaining")
+        bf = pysam.AlignmentFile(path, 'rb')
+        # Only iterate reads on this chromosome
+        try:
+            read_iter = bf.fetch(contig=chrom)
+        except ValueError:
+            bf.close()
+            continue
+
+        for read in read_iter:
+            n_reads += 1
 
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
@@ -410,47 +429,37 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                 continue
             strand_counts[strand] += 1
 
-            origin = read.reference_start if strand=='+' else read.reference_end-1
-            endpos = read.reference_end-1 if strand=='+' else read.reference_start
-            chrom = bf.get_reference_name(read.reference_id)
+            origin = read.reference_start if strand == '+' else read.reference_end - 1
+            endpos = read.reference_end - 1 if strand == '+' else read.reference_start
 
-            if nested_tree[chrom].at(origin):
+            if nested_tree_chrom and nested_tree_chrom.at(origin):
                 continue
 
             L = read.reference_start
             R = read.reference_end  # half-open
-            gene_hits = gene_tree[chrom].overlap(L, R)
-            if gene_hits:       
+            gene_hits = gene_tree_chrom.overlap(L, R) if gene_tree_chrom else set()
+            if gene_hits:
                 MIN_INTRON_LEN = 69
                 ex_n, in_n, ex_total, in_total, exin_fields, saw_real = exon_intron_row_fields(
-                read,
-                min_intron_len=MIN_INTRON_LEN,
-                max_exons=5,
-                length_mode="query"
+                    read,
+                    min_intron_len=MIN_INTRON_LEN,
+                    max_exons=5,
+                    length_mode="query"
                 )
-                #n_real_N = sum(1 for op,ln in (read.cigartuples or []) if op==3 and ln>=MIN_INTRON_LEN)
-                #if n_real_N >= 4:
-                    #print("5+ exon candidate:", read.query_name, "real_N=", n_real_N, "cigar=", read.cigarstring)
-                # Only write rows when spliced
                 if saw_real:
                     for iv in gene_hits:
                         gid = iv.data
                         gstrand = gene_info[gid]['strand']
                         if strand != gstrand:
                             continue
+                        _ensure_gid(gid)
                         gene_stats[gid]['total'] += 1
                         gene_tss[gid].append(origin)
                         gene_exon_rows.append((
-                            gid,
-                            chrom,
-                            origin,
-                            read.query_name,
-                            read.mapping_quality,
+                            gid, chrom, origin,
+                            read.query_name, read.mapping_quality,
                             int(read.is_reverse),
-                            ex_n,
-                            in_n,
-                            ex_total,
-                            in_total,
+                            ex_n, in_n, ex_total, in_total,
                             *exin_fields
                         ))
                 else:
@@ -459,19 +468,27 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                         gstrand = gene_info[gid]['strand']
                         if strand != gstrand:
                             continue
+                        _ensure_gid(gid)
                         gene_stats[gid]['total'] += 1
                         gene_tss[gid].append(origin)
-
                 continue
 
             # compute once per read (cheap)
             clip3S = softclip_3prime(read)
 
-            for eid in {iv.data for iv in full_tree[chrom].at(origin)}:
+            overlap_eids = {iv.data for iv in full_tree_chrom.at(origin)} if full_tree_chrom else set()
+            for eid in overlap_eids:
                 element = elem_info[eid]
-                elem_strand = element['strand']
-                ltr5 = element['ltr_left'] if elem_strand=='+' else element['ltr_right']
-                ltr3 = element['ltr_right'] if elem_strand=='+' else element['ltr_left']
+                elem_strand = element.get('strand', '.')
+
+                # Accumulate missing strand votes
+                if elem_strand not in ('+', '-'):
+                    if eid not in infer_votes:
+                        infer_votes[eid] = {'+': 0, '-': 0}
+                    infer_votes[eid][strand] += 1
+                    
+                ltr5 = element['ltr_left'] if elem_strand == '+' else element['ltr_right']
+                ltr3 = element['ltr_right'] if elem_strand == '+' else element['ltr_left']
                 if not ltr5 or not ltr3:
                     continue
 
@@ -498,14 +515,14 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                     elif ltr5[0] <= endpos < ltr5[1]:
                         cat = 'spanning'
 
-                MIN_INTRON_LEN = 69 
+                MIN_INTRON_LEN = 69
                 has_real_intron = False
                 if read.cigartuples:
                     for op, length in read.cigartuples:
                         if op == 3 and length >= MIN_INTRON_LEN:
                             has_real_intron = True
                             break
-                        
+
                 if cat == 'spanning':
                     coding_start = element['ltr_left'][1]
                     coding_end   = element['ltr_right'][0]
@@ -515,18 +532,18 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                             max(0, min(b2, coding_end) - max(b1, coding_start))
                             for b1, b2 in read.get_blocks()
                         )
-                        if covered/coding_len < 0.5 and has_real_intron:
+                        if covered / coding_len < 0.5 and has_real_intron:
                             if ltr5[0] <= origin < ltr5[1]:
-                                cat = 'spliced_ltr_left' if elem_strand=='+' else 'spliced_ltr_right'
+                                cat = 'spliced_ltr_left' if elem_strand == '+' else 'spliced_ltr_right'
                             elif ltr3[0] <= origin < ltr3[1]:
-                                cat = 'spliced_ltr_right' if elem_strand=='+' else 'spliced_ltr_left'
+                                cat = 'spliced_ltr_right' if elem_strand == '+' else 'spliced_ltr_left'
                             else:
                                 cat = None
 
                 if not cat:
                     continue
 
-                # ---- record isoform stats (existing) ----
+                _ensure_eid(eid)
                 rec = stats[eid]
                 rec['total'] += 1
                 rec['counts'][cat] += 1
@@ -537,7 +554,6 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                 if has_real_intron:
                     rec['spliced'][cat] += 1
 
-                # record of 3' soft-clipping for spliced reads indicating if ltr-contained ----
                 stayed_in_ltr5 = (ltr5[0] <= origin < ltr5[1]) and (ltr5[0] <= endpos < ltr5[1])
                 stayed_in_ltr3 = (ltr3[0] <= origin < ltr3[1]) and (ltr3[0] <= endpos < ltr3[1])
 
@@ -549,49 +565,165 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
                 )
 
                 if saw_real:
-                    # Checking exons only of potential lncRNA loci
-                    if (stayed_in_ltr5 or stayed_in_ltr3):
+                    if stayed_in_ltr5 or stayed_in_ltr3:
                         ltr_exon_rows.append((
                             eid, chrom, origin, cat, read.query_name, read.mapping_quality,
                             int(read.is_reverse),
                             n_exons, n_introns, ex_total, in_total,
                             *fields
                         ))
-
                     clip_rows_splice.append((
-                        eid,
-                        chrom,
-                        origin,
+                        eid, chrom, origin,
                         "ltr5c_spliced" if stayed_in_ltr5 else "ltr3c_spliced" if stayed_in_ltr3 else cat,
                         cat,
-                        read.query_name,
-                        read.mapping_quality,
+                        read.query_name, read.mapping_quality,
                         int(read.is_reverse),
-                        clip3S,
-                        read.reference_start,
-                        read.reference_end
+                        clip3S, read.reference_start, read.reference_end
                     ))
                 else:
                     clip_rows_nonsplice.append((
-                        eid,
-                        chrom,
-                        origin,
+                        eid, chrom, origin,
                         "ltr5c_nonspliced" if stayed_in_ltr5 else "ltr3c_nonspliced" if stayed_in_ltr3 else cat,
                         cat,
-                        read.query_name,
-                        read.mapping_quality,
+                        read.query_name, read.mapping_quality,
                         int(read.is_reverse),
-                        clip3S,
-                        read.reference_start,
-                        read.reference_end
+                        clip3S, read.reference_start, read.reference_end
                     ))
 
         bf.close()
 
-    print(f"Classification complete in {(time.time()-start_time)/60:.1f} minutes.")
-    print(f"Strand counts across all reads:", strand_counts)
+    elapsed = time.time() - t0
+    print(f"  {chrom}: {n_reads} reads processed in {elapsed:.1f}s")
 
-    # Write clipping table if requested
+    return {
+        'chrom': chrom,
+        'strand_counts': strand_counts,
+        'stats': stats,
+        'gene_stats': gene_stats,
+        'gene_tss': gene_tss,
+        'tss_positions': tss_positions,
+        'end_positions': end_positions,
+        'clip_rows_splice': clip_rows_splice,
+        'clip_rows_nonsplice': clip_rows_nonsplice,
+        'ltr_exon_rows': ltr_exon_rows,
+        'gene_exon_rows': gene_exon_rows,
+        'infer_votes': infer_votes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher: shards by chromosome, merges results, writes output files
+# ---------------------------------------------------------------------------
+def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_info,
+                           gene_tree, bam_paths, min_mapq, clip_out_splice=None,
+                           clip_out_nonsplice=None, ltr_exon_out=None, gene_exon_out=None,
+                           n_threads=1):
+    cats = _CATS
+
+    # Discover chromosomes present in the BAMs
+    chroms = sorted({ref for p in bam_paths
+                     for ref in pysam.AlignmentFile(p, 'rb').references})
+    print(f"Dispatching {len(chroms)} chromosomes across {n_threads} process(es)...")
+
+    start_time = time.time()
+
+    # Pre-populate globals for the main process so `fork()` naturally shares them to workers.
+    # Note: On Linux, `initargs` isn't strictly necessary since it defaults to fork,
+    # but providing it guarantees strict compatibility for Windows/Mac (spawn methods).
+    global _GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, _GLOBAL_FULL_TREE
+    global _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE
+    _GLOBAL_ELEM_INFO = elem_info
+    _GLOBAL_GENE_INFO = gene_info
+    _GLOBAL_FULL_TREE = full_tree
+    _GLOBAL_NESTED_TREE = nested_tree
+    _GLOBAL_GENE_TREE = gene_tree
+
+    # Build argument tuples - ONLY strings and integers! (Bypasses Pickling bottlenecks natively!)
+    args_list = [
+        (chrom, bam_paths, min_mapq)
+        for chrom in chroms
+    ]
+
+    if n_threads > 1:
+        with Pool(processes=n_threads, 
+                  initializer=init_worker, 
+                  initargs=(_GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, 
+                            _GLOBAL_FULL_TREE, _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE)) as pool:
+            results = pool.starmap(_classify_chrom, args_list)
+    else:
+        results = [_classify_chrom(*a) for a in args_list]
+
+    # Merge per-chromosome results -----------------------------------------
+    strand_counts = Counter()
+    stats = {eid: {'total': 0,
+                   'counts': {c: 0 for c in cats},
+                   'lengths': {c: 0 for c in cats},
+                   'spliced': {c: 0 for c in cats},
+                   'junctions': {c: set() for c in cats},
+                   'strands': {c: [] for c in cats}}
+             for eid in elem_info}
+    gene_stats = {gid: {'total': 0} for gid in gene_info}
+    gene_tss = {gid: [] for gid in gene_info}
+    tss_positions = {eid: {c: [] for c in cats} for eid in elem_info}
+    end_positions = {eid: {c: [] for c in cats} for eid in elem_info}
+    clip_rows_splice = []
+    clip_rows_nonsplice = []
+    ltr_exon_rows = []
+    gene_exon_rows = []
+    global_infer_votes = {}
+
+    for res in results:
+        strand_counts += res['strand_counts']
+
+        for eid, r in res['stats'].items():
+            s = stats[eid]
+            s['total'] += r['total']
+            for c in cats:
+                s['counts'][c] += r['counts'][c]
+                s['lengths'][c] += r['lengths'][c]
+                s['spliced'][c] += r['spliced'][c]
+                s['junctions'][c] |= r['junctions'][c]
+                s['strands'][c].extend(r['strands'][c])
+
+        for gid, r in res['gene_stats'].items():
+            if gid not in gene_stats:
+                gene_stats[gid] = {'total': 0}
+                gene_tss[gid] = []
+            gene_stats[gid]['total'] += r['total']
+
+        for gid, positions in res['gene_tss'].items():
+            if gid not in gene_tss:
+                gene_tss[gid] = []
+            gene_tss[gid].extend(positions)
+
+        for eid, pos_dict in res['tss_positions'].items():
+            for c in cats:
+                tss_positions[eid][c].extend(pos_dict[c])
+
+        for eid, pos_dict in res['end_positions'].items():
+            for c in cats:
+                end_positions[eid][c].extend(pos_dict[c])
+
+        clip_rows_splice.extend(res['clip_rows_splice'])
+        clip_rows_nonsplice.extend(res['clip_rows_nonsplice'])
+        ltr_exon_rows.extend(res['ltr_exon_rows'])
+        gene_exon_rows.extend(res['gene_exon_rows'])
+
+        # Merge strand inference votes
+        for eid, votes in res['infer_votes'].items():
+            if eid not in global_infer_votes:
+                global_infer_votes[eid] = {'+':0, '-':0}
+            global_infer_votes[eid]['+'] += votes['+']
+            global_infer_votes[eid]['-'] += votes['-']
+
+    # Apply majority strand inference back to elem_info
+    for eid, counts in global_infer_votes.items():
+        elem_info[eid]['strand'] = '+' if counts['+'] >= counts['-'] else '-'
+
+    print(f"Classification complete in {(time.time() - start_time) / 60:.1f} minutes.")
+    print(f"Strand counts across all reads: {strand_counts}")
+
+    # Write output files (unchanged) ----------------------------------------
     if clip_out_splice:
         with open(clip_out_splice, "w") as out:
             out.write("\t".join([
@@ -611,7 +743,7 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
             for row in clip_rows_nonsplice:
                 out.write("\t".join(map(str, row)) + "\n")
         print(f"Wrote 3' soft-clipping records for non-spliced reads to {clip_out_nonsplice}")
-        
+
     if ltr_exon_out:
         with open(ltr_exon_out, "w") as out:
             out.write("\t".join([
@@ -636,7 +768,17 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
 
     return stats, tss_positions, end_positions, gene_stats, gene_tss
     
-def write_tsv(elem_info, stats, prefix):
+def write_tsv(elem_info, stats, prefix, qual_scores=None):
+    """
+    Write the per-element LTR summary TSV.
+
+    Parameters
+    ----------
+    qual_scores : dict or None
+        Optional mapping of eid -> {'mean': float|'NA', 'median': float|'NA'}
+        as returned by compute_base_quality_scores(). When provided, two extra
+        columns are appended: mean_base_qual and median_base_qual.
+    """
     cats = ['ltr_left','ltr_right','spanning','ro5','ro3']
     rows = []
     for eid, info in elem_info.items():
@@ -661,6 +803,7 @@ def write_tsv(elem_info, stats, prefix):
                 f'unique_juncts_{cat}': junc_count
             })
         rows.append(row)
+
     df = pd.DataFrame(rows).sort_values('total_reads', ascending=False)
     out_path = prefix + '.tsv'
     df.to_csv(out_path, sep='\t', index=False)
@@ -963,9 +1106,9 @@ def main():
         clip_out_splice,
         clip_out_nonsplice,
         ltr_exon_out,
-        gene_exon_out
+        gene_exon_out,
+        n_threads=args.threads
     )
-    infer_element_strands(elem_info, full_tree, args.bam, args.min_mapq)
     densities = compute_tss_density_separate(stats,
                                          tss_positions,
                                          elem_info,
