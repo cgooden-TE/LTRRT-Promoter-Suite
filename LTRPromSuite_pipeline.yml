@@ -1,4 +1,4 @@
-name: Nanopore_pipeline
+name: LTRPromSuite_pipeline
 channels:
   - conda-forge
   - bioconda
