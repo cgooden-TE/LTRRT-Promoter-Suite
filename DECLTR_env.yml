@@ -1,0 +1,25 @@
+## GenomicAlignments and GenomicFeatures may need manual install via BiocManager if conda solver conflicts arise
+name: DECLTR-env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.2
+  - bioconductor-deseq2
+  - bioconductor-tximport
+  - bioconductor-rsamtools
+  - bioconductor-genomicranges
+  - bioconductor-genomicalignments
+  - bioconductor-genomicfeatures
+  - bioconductor-summarizedexperiment
+  - bioconductor-biocparallel
+  - bioconductor-wgcna
+  - r-tidyverse
+  - r-data.table
+  - r-devtools
+  - r-openxlsx
+  - r-qs
+  - r-segmented
+  - ca-certificates
+  - openssl
