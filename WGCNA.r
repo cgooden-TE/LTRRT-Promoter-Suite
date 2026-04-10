@@ -1,19 +1,19 @@
 ## WGCNA
 library(WGCNA)
 
-adj_logCPM <- readRDS("/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/WGCNA/adj_logCPM.rds")
-meta <- readRDS("/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/WGCNA/pca_metadata.rds")
+adj_vst <- readRDS("adj_vst.rds")
+meta <- readRDS("pca_metadata-vst.rds")
 #### 1
 options(stringsAsFactors = FALSE)
 # Enable threading if available (Linux/macOS)
 enableWGCNAThreads() # on some systems allowWGCNAThreads() is used instead
 # Make sure columns (samples) order matches meta
-stopifnot(all(colnames(adj_logCPM) %in% rownames(meta)))
-meta <- meta[colnames(adj_logCPM), , drop = FALSE]
-stopifnot(identical(colnames(adj_logCPM), rownames(meta)))
+stopifnot(all(colnames(adj_vst) %in% rownames(meta)))
+meta <- meta[colnames(adj_vst), , drop = FALSE]
+stopifnot(identical(colnames(adj_vst), rownames(meta)))
 
 # WGCNA expects samples in rows, genes in columns
-datExpr0 <- t(adj_logCPM)
+datExpr0 <- t(adj_vst)
 
 # Basic sanity check and removal of bad samples/genes
 gsg <- goodSamplesGenes(datExpr0, verbose = 3)
@@ -32,11 +32,12 @@ sampleTree <- hclust(dist(datExpr), method = "average")
 # datExpr <- datExpr[clust==1,]
 
 #### 2
+sample_ids <- rownames(datExpr)  # these are sample IDs
 traits <- data.frame(
-    platform = factor(meta[colnames(adj_logCPM), "platform"]),
-    tissue   = factor(meta[colnames(adj_logCPM), "tissue_umap"])
+  platform = factor(meta[sample_ids, "platform"]),
+  tissue   = factor(meta[sample_ids, "tissue_umap"])
 )
-rownames(traits) <- rownames(datExpr)
+rownames(traits) <- sample_ids
 
 # One-hot encode categorical traits for correlations
 traitMat <- model.matrix(~ 0 + platform + tissue, data = traits)
@@ -112,5 +113,5 @@ saveRDS(list(
     traits = traits,
     datExpr = datExpr,
     softpwr = softPower
-), file = "WGCNA_fullResults.rds")
+), file = "WGCNA_fullResults_021926.rds")
 
