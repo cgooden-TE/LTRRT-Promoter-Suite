@@ -1,59 +1,246 @@
 # LTRRT-Promoter-Suite
-Tools developed to characterize the U3 promoter regions and transcription events of long terminal repeat retrotransposons in maize.
 
-### Developer Notes
-**AccuMap:** AccuMap was developed primarily for use with ONT long-reads. It requires that reads not have been demultiplexed or trimemed, only base-called, for optimal usage conditions in PyChopper. If not using ONT sequencing data, the pipeline can be started at the --run_cut step as long as reads have not been previously trimmed and still contain homoploymers (poly(A) or poly(T)). \
-**IsoClassifier:** IsoClassifier is best used with a feature reference containing annotations for all transposons and genes for your organism of interest in order to remove nested features. It *must* contain records for the long terminal repeats (lTLR and rLTR as named by EDTA) of each LTR-RT in addition to the full annotation for each structurally intact LTR-RT locus. \
-**WindowScrubber:** WindowScrubber uses the outputs of IsoClassifier to set its search window for each motif context. If you have your own TSS identifications (for example from CAGE), these can be used, but the U3/LTR sequence files from IsoClassifier are still required and the file formatting / name conventions must match IsoClassifier's TSS output to find the primary TSS coordinate. \
-**DECLTR:** DECLTR is made publicly available for purposes of development transparency, but it should be noted that the methods implemented are tuned to the specific data types and naming conventions utilized in this analysis. Reuse of this method will require re-tooling the functions for your data until the more broadly-applicable version is released. \
+A suite of tools for characterizing the U3 promoter regions and transcription events of long terminal repeat retrotransposons (LTR-RTs) in maize.
 
+---
 
-### Usage
-First, git clone this repository and build the environments included as .yml files. 
-```
+## Table of Contents
+
+- [Installation](#installation)
+- [AccuMap](#accumap)
+- [IsoClassifier](#isoclassifier)
+- [WindowScrubber](#windowscrubber)
+- [DECLTR](#decltr)
+- [Developer Notes](#developer-notes)
+
+---
+
+## Installation
+
+Clone the repository and build the conda environments:
+
+```bash
 git clone https://github.com/cgooden-TE/LTRRT-Promoter-Suite
 cd LTRRT-Promoter-Suite
 
-# Env used for AccuMap, IsoClassifier, and WindowScrubber
-mamba env create -f Nanopore_pipeline_final.yml
+# Environment for AccuMap, IsoClassifier, and WindowScrubber
+mamba env create -f LTRPromSuite_pipeline.yml
+mamba activate LTRPromSuite_pipeline
 
-# Env used for WGCNA and DECLTR
-mamba env create -f R-DESeq-env.yml
-
-# Activate the environment
-mamba activate <env>
+# Environment for DECLTR (and WGCNA)
+mamba env create -f DECLTR_env.yml
+mamba activate DECLTR-env
 ```
 
-#### AccuMap
-**Minimum inputs:**\
-    --fq, Input FASTQ of untrimmed, demultiplexed reads\
-    --pyc, PyChopper output FASTQ filename\
-    --sample, Sample name prefix (ex. Control_1)\
-    --run_pyc, Runs PyChopper with default settings\
-    --run_cut, Runs Cutadapt with default settings\
-    --run_map, Runs Minimap2 with default settings\
-    --ref, Reference genome. Ensure chromosome nomenclature is consistent.\
-    --kit, for ONT reads, default="PCB114"\
+---
 
-**Outputs (using provided sample name prefix):**\
-    - cutadapt.fastq : FASTQ after Cutadapt trimming\
-    - cutadapt.log : Log file from Cutadapt run\
-    - pychopped.fastq : Reads FASTQ after PyChopper primer removal\
-    - pychopper.log : Log file from PyChopper run\
-    - pychopper.report.pdf : PDF report from PyChopper\
-    - pychopper.rescued.fastq : FASTQ of rescued reads from PyChopper\
-    - minimap2.log : Log file from Minimap2 run\
-    - minimap2.sam : SAM file from Minimap2 alignment\
-    - strandtags.tsv : TSV file of read names and PyChopper strand orientations\
-    - STtagged.bam : BAM file with PyChopper strand tags (ST) added\
-    - STtagged.bed : BED file conversion of BAM with strand information\
-    - STtagged.sorted.bam : Sorted BAM file with PyChopper strand tags\
+## AccuMap
 
+Read directionalization, trimming, and alignment pipeline for long-read transcriptomics. Wraps PyChopper, Cutadapt, and Minimap2 into a single command, annotating output BAM files with strand-of-origin tags for downstream isoform analysis.
 
-#### IsoClassifier 
+### Inputs
 
-#### WindowScrubber
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--fq` | Yes | Input FASTQ of untrimmed, demultiplexed reads |
+| `--sample` | Yes | Sample name prefix used for all output filenames |
+| `--ref` | Yes (with `--run_map`) | Reference genome FASTA |
+| `--run_pyc` | No | Run PyChopper for ONT primer removal |
+| `--run_cut` | No | Run Cutadapt for homopolymer trimming |
+| `--run_map` | No | Run Minimap2 splice-aware alignment |
+| `--kit` | No | ONT sequencing kit (default: `PCB114`). Set to `none` for non-ONT data |
+| `--map_preset` | No | Minimap2 preset: `splice` (default, ONT), `splice:hq` (PacBio), or `none` |
+| `--pyc_threads` | No | PyChopper threads (default: 8) |
+| `--cut_threads` | No | Cutadapt threads (default: 16) |
+| `--map_threads` | No | Minimap2 threads (default: 24) |
+| `--map_sec` | No | Allow secondary alignments (default: `no`) |
+| `--map_gap` | No | Max intron length for Minimap2 (default: 5000) |
 
-#### DECLTR
+### Outputs
 
-#### WGCNA
+All files are prefixed with the `--sample` name:
+
+| File | Description |
+|------|-------------|
+| `<sample>.pychopped.fastq` | Reads after PyChopper primer removal |
+| `<sample>.cutadapt.fastq` | Reads after Cutadapt homopolymer trimming |
+| `<sample>.minimap2.sorted.bam` | Sorted, indexed BAM from Minimap2 |
+| `<sample>.strandtags.tsv` | Read name to PyChopper strand orientation mapping |
+| `<sample>.STtagged.sorted.bam` | Sorted BAM annotated with PyChopper strand tags (ST) |
+| `<sample>.STtagged.bed` | BED file with strand-resolved alignments |
+| `<sample>.pychopper.log` | PyChopper log |
+| `<sample>.pychopper.report.pdf` | PyChopper QC report |
+| `<sample>.pychopper.rescued.fastq` | PyChopper rescued reads |
+| `<sample>.cutadapt.log` | Cutadapt log |
+| `<sample>.minimap2.log` | Minimap2 log |
+
+### Example
+
+```bash
+# Full pipeline (ONT reads)
+python3 AccuMap.py \
+    --fq raw_reads.fastq \
+    --sample CT_1 \
+    --ref Zm-B73-REFERENCE-NAM-5.0.fa \
+    --run_pyc \
+    --run_cut \
+    --run_map
+
+# PacBio reads (skip PyChopper, use splice:hq preset)
+python3 AccuMap.py \
+    --fq hifi_reads.fastq \
+    --sample PB_Ear_1 \
+    --ref Zm-B73-REFERENCE-NAM-5.0.fa \
+    --kit none \
+    --map_preset splice:hq \
+    --run_cut \
+    --run_map
+```
+
+---
+
+## IsoClassifier
+
+Classifies reads overlapping structurally intact LTR retrotransposons into isoform categories (left-LTR, right-LTR, spanning, read-over-5', read-over-3') and summarizes gene-level read counts and TSS positions. Uses interval trees to identify and exclude reads originating from nested transposable elements. Parallelizes classification by chromosome.
+
+### Inputs
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--gff` | Yes | GFF annotation with LTR retrotransposons (including left/right LTRs), genes, and nested features |
+| `--bam` | Yes | One or more BAM files (space-separated) |
+| `--output` | Yes | Output prefix for LTR isoform TSV and per-read files |
+| `--tss_out` | Yes | Output path for LTR isoform TSS summary |
+| `--gene_out` | Yes | Output path for gene read count and TSS summary |
+| `--min_mapq` | No | Minimum mapping quality filter (default: 30) |
+| `--threads` | No | Parallel processes for per-chromosome classification (default: 1) |
+
+### Outputs
+
+All LTR output files use the `--output` prefix:
+
+| File | Description |
+|------|-------------|
+| `<output>.tsv` | Per-element LTR isoform summary with read counts, percentages, mean lengths, splice counts, and unique junctions per category |
+| `<tss_out>` | LTR TSS summary: top isoform, strand, total reads, and top 2 TSS positions per element |
+| `<gene_out>` | Gene summary: total reads and top 2 TSS positions per gene |
+| `<output>_primary_tss_density.tsv` | LTR primary TSS read density histogram |
+| `<output>_secondary_tss_density.tsv` | LTR secondary TSS read density histogram |
+| `<output>_gene_primary_density.tsv` | Gene primary TSS read density histogram |
+| `<output>_gene_secondary_density.tsv` | Gene secondary TSS read density histogram |
+| `<output>_ltr_3p_softclip_per_read_spliced.tsv` | Per-read 3' soft-clip data for spliced LTR reads |
+| `<output>_ltr_3p_softclip_per_read_nonspliced.tsv` | Per-read 3' soft-clip data for non-spliced LTR reads |
+| `<output>_ltr_exon_stats_per_read.tsv` | Per-read exon/intron structure for LTR-contained spliced reads |
+| `<output>_gene_exon_stats_per_read.tsv` | Per-read exon/intron structure for gene spliced reads |
+
+### Example
+
+```bash
+python3 IsoClassifier.py \
+    --gff Zm-B73_TE_and_gene_annotations.gff \
+    --bam CT_1.STtagged.sorted.bam CT_2.STtagged.sorted.bam CT_3.STtagged.sorted.bam \
+    --min_mapq 30 \
+    --threads 8 \
+    --output CT_LTR_isoforms \
+    --tss_out CT_LTR_TSS_summary.tsv \
+    --gene_out CT_Gene_summary.tsv
+```
+
+---
+
+## WindowScrubber
+
+Motif scanner for LTR U3 promoter regions. Identifies core promoter elements (TATA box, CCAAT box, Y Patch, Inr, DPE, secondary TATA) and TA-rich regions using PWM log-odds scoring with FIMO-style p-values, and detects statistically significant CA dinucleotide runs. All hits are stored in a SQLite database for flexible downstream querying.
+
+### Inputs
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `-l` / `--ltr-fasta` | Yes | FASTA of full LTR sequences (headers: `>Feature\|chr:start-end(strand)`) |
+| `-u3` / `--u3-fasta` | Yes | FASTA of U3 region sequences (same header format) |
+| `-t` / `--tss-summary` | Yes | TSS summary TSV from IsoClassifier (Feature, TSS1 columns) |
+| `-db` / `--database` | Yes | Output SQLite database filename |
+| `--pwm-json` | No | Custom PWM definitions in JSON format |
+| `--tata_mismatch` | No | Allowed mismatches for TATA box (default: 0) |
+| `--ccaat_mismatch` | No | Allowed mismatches for CCAAT box (default: 0) |
+| `--ypatch_mismatch` | No | Allowed mismatches for Y Patch (default: 0) |
+| `--inr_mismatch` | No | Allowed mismatches for Inr (default: 0) |
+| `--window-size` | No | Sliding window size for TA-rich detection (default: 10) |
+| `--ta-threshold` | No | TA fraction threshold for TA-rich windows (default: 0.75) |
+| `--sig-alpha` | No | Per-motif significance level (default: 1e-4) |
+| `--ca-min-length` | No | Minimum CA dinucleotide run length (default: 10) |
+| `--ca-alpha` | No | Significance level for CA runs (default: 0.05) |
+| `--tata-max-dist` | No | Max upstream distance for primary TATA from TSS (default: 100) |
+| `--inr-max-dist` | No | Max offset around TSS for Inr motif (default: 10) |
+| `--bg-{A,C,G,T}` | No | Background nucleotide frequencies (default: 0.25 each) |
+| `--bg-n` | No | Background k-mers for null distribution (default: 200000) |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `<database>.db` | SQLite database containing five tables: |
+| &emsp; `elements` | Feature metadata, coordinates, TSS position, and U3/LTR sequence lengths |
+| &emsp; `ta_regions` | TA-rich regions per element (relative and absolute coordinates) |
+| &emsp; `ca_runs` | All significant CA dinucleotide runs with p-values |
+| &emsp; `motif_hits` | All motif matches (TATA, CCAAT, Y Patch, Inr, DPE, secondary TATA) with scores, p-values, and distances to TSS |
+| &emsp; `thresholds` | Per-motif score thresholds and significance cutoffs |
+
+### Example
+
+```bash
+python3 WindowScrubber.py \
+    -l CT_full_ltr_sequences.fa \
+    -u3 CT_u3_regions.fa \
+    -t CT_LTR_TSS_summary.tsv \
+    -db CT_motif_hits.db \
+    --tata_mismatch 1 \
+    --ccaat_mismatch 0 \
+    --sig-alpha 1e-4
+```
+
+---
+
+## DECLTR
+
+R-based multi-omic integration and activity classification pipeline for LTR retrotransposons and genes. Merges expression data from Illumina, PacBio, and ONT platforms with ChIP-seq (H3K4me3, H3K27ac), DNA methylation (UMR), CAGE, and promoter motif annotations. Uses segmented regression to estimate per-platform expression thresholds, applies sigmoid-transformed scoring across tissue groups, and assigns activity labels (Constitutive, Facultative, Tissue-Specific, Developmental, Vegetative, or Inactive).
+
+> **Note:** DECLTR is provided for transparency. The current implementation is tuned to specific data types and EDTA naming conventions used in this analysis. Reuse will require adapting the hardcoded file paths and column-naming logic for your data.
+
+### Inputs
+
+DECLTR reads from directory structures rather than command-line arguments. The following paths are set at the top of the script and must be edited before running:
+
+| Variable | Description |
+|----------|-------------|
+| `data_dir` | Directory of ChIP-seq and UMR intersect GFF files (bedtools intersect outputs) |
+| `isoform_dir` | Directory of IsoClassifier output TSVs (isoform counts and TSS summaries) |
+| `motif_dir` | Directory of WindowScrubber/Query_WSDB motif summary TSVs |
+| `combined_ref` | GFF annotation file with LTR retrotransposons and genes |
+| `illumina_path` | TSV of Illumina short-read expression counts per feature |
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `Segmented_Breakpoints.csv` | Per-platform (Illumina, PacBio, ONT) segmented-regression expression thresholds on log1p scale |
+| `*.qs` | Serialized R object (qs format) of the fully labeled data frame with all merged annotations, activity scores, and classification labels |
+
+### Example
+
+```bash
+# Edit paths at top of DECLTR.r, then:
+Rscript DECLTR.r
+```
+
+---
+
+## Developer Notes
+
+**AccuMap:** Developed primarily for ONT long reads. Requires that reads have not been demultiplexed or trimmed, only base-called, for optimal usage with PyChopper. For non-ONT data, start at the `--run_cut` step as long as reads still contain homopolymers (poly(A) or poly(T)).
+
+**IsoClassifier:** Best used with a GFF containing annotations for all transposons and genes to enable nested-element removal. The GFF *must* contain records for the left and right long terminal repeats (lLTR and rLTR as named by EDTA) of each LTR-RT, in addition to the full `LTR_retrotransposon` annotation for each structurally intact locus.
+
+**WindowScrubber:** Uses IsoClassifier outputs to define search windows for each motif context. External TSS data (e.g., from CAGE) can substitute for IsoClassifier TSS calls, but the U3/LTR FASTA files from IsoClassifier are still required and the TSS file must match IsoClassifier's column format (`Feature`, `TSS1`).
+
+**DECLTR:** Provided for development transparency. The methods are tuned to the data types and EDTA naming conventions used in this analysis. Reuse requires re-tooling the hardcoded paths and parsing logic for your data until the generalized version is released.
