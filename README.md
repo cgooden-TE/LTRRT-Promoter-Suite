@@ -10,6 +10,7 @@ A suite of tools for characterizing the U3 promoter regions and transcription ev
 - [AccuMap](#accumap)
 - [IsoClassifier](#isoclassifier)
 - [WindowScrubber](#windowscrubber)
+- [Query_WSDB](#query_wsdb)
 - [DECLTR](#decltr)
 - [Developer Notes](#developer-notes)
 
@@ -197,6 +198,105 @@ python3 WindowScrubber.py \
     --tata_mismatch 1 \
     --ccaat_mismatch 0 \
     --sig-alpha 1e-4
+```
+
+---
+
+## Query_WSDB
+
+Query interface for the WindowScrubber SQLite database. Retrieves, filters, and summarizes motif hits, CA dinucleotide runs, and promoter element composition across LTR retrotransposons. Supports flexible ranking, distance-based filtering, threshold enforcement, and multi-motif presence queries.
+
+### Inputs
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `-db` / `--database` | Yes | SQLite database file produced by WindowScrubber |
+
+**Query mode** (mutually exclusive, one required):
+
+| Flag | Description |
+|------|-------------|
+| `--best-per-element MOTIF` | Best hit per element for a specific motif type |
+| `--best-all-motifs` | Best hit for every motif type per element (wide format, one row per element) |
+| `--all-hits` | All hits with optional filtering |
+| `--require-motifs MOTIF1,MOTIF2,...` | Elements containing all specified motif types |
+| `--stats` | Print database summary statistics to stdout |
+| `--ca-summary` | Export CA dinucleotide run data |
+
+**Filtering options:**
+
+| Flag | Description |
+|------|-------------|
+| `--motif-type` | Filter by motif type (TATA, CCAAT, YPATCH, INR7, DPE7, SEC_TATA) |
+| `--min-score` / `--max-score` | PWM score range |
+| `--min-dist` / `--max-dist` | Absolute distance-to-TSS range |
+| `--in-ta-region` | Only hits within TA-rich regions |
+| `--features` | Comma-separated list of feature IDs to include |
+| `--p-max` | Maximum p-value threshold |
+| `--range` | Single distance range as `lo:hi` (relative to TSS) |
+| `--ranges` | Per-motif distance ranges (e.g., `TATA:-100:0,CCAAT:-460:-140,INR7:-10:10`) |
+| `--apply-threshold` | Require score >= stored threshold from the database |
+| `--threshold-method` | Threshold method to apply (default: `empirical_p`) |
+| `--threshold-param` | Specific parameter string (e.g., `alpha=1e-4;bg=iid;n=200000`) |
+| `--order-by` | Column to rank by for `--best-per-element`: `score`, `dist_to_tss`, or `y_count` (default: `score`) |
+| `--ascending` | Pick lowest value instead of highest when ranking |
+| `--ca-min-length` | Minimum CA run length |
+| `--ca-all` | Include non-significant CA runs |
+| `-o` / `--output` | Output TSV path. If omitted, prints first 10 results to stdout |
+
+### Outputs
+
+All query modes write tab-separated (TSV) files (or print to stdout when `-o` is omitted):
+
+| Query Mode | Output Description |
+|------------|--------------------|
+| `--best-per-element` | One row per element with the top-ranked hit for the requested motif (feature, motif_type, coordinates, dist_to_tss, score, p_value, sequence, in_ta_region, y_count) |
+| `--best-all-motifs` | One row per element in wide format with columns for each motif type (`{MOTIF}_start_abs`, `{MOTIF}_end_abs`, `Dist_TSS_to_{MOTIF}`; `-1` if absent) |
+| `--all-hits` | One row per hit with full metadata (feature, motif_type, coordinates, score, p_value, sequence, chrom, strand, tss_abs) |
+| `--require-motifs` | One row per qualifying element with a `found_motifs` column listing all motifs present |
+| `--ca-summary` | One row per CA run (feature, coordinates, length, p_value, is_significant, chrom, strand) |
+| `--stats` | Summary printed to stdout: element count, per-motif hit counts, score statistics, TA-region counts, and CA run counts |
+
+### Examples
+
+```bash
+# Database summary statistics
+python3 Query_WSDB.py -db CT_motif_hits.db --stats
+
+# Best TATA hit per element ranked by score
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --best-per-element TATA \
+    --order-by score \
+    -o CT_best_tata.tsv
+
+# Best hit for every motif type per element (wide format)
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --best-all-motifs \
+    -o CT_best_all_motifs.tsv
+
+# All TATA hits within TA-rich regions
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --all-hits \
+    --motif-type TATA \
+    --in-ta-region \
+    -o CT_tata_in_ta.tsv
+
+# All hits with motif-specific distance ranges and threshold enforcement
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --all-hits \
+    --ranges "TATA:-100:0,CCAAT:-460:-140,INR7:-10:10,DPE7:0:50" \
+    --apply-threshold \
+    -o CT_filtered_hits.tsv
+
+# Elements that contain TATA, CCAAT, and INR7 motifs
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --require-motifs TATA,CCAAT,INR7 \
+    -o CT_complete_promoters.tsv
+
+# Export significant CA dinucleotide runs
+python3 Query_WSDB.py -db CT_motif_hits.db \
+    --ca-summary \
+    -o CT_ca_runs.tsv
 ```
 
 ---
