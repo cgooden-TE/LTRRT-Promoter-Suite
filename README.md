@@ -36,7 +36,7 @@ mamba activate DECLTR-env
 
 ## AccuMap
 
-Read directionalization, trimming, and alignment pipeline for long-read transcriptomics. Wraps PyChopper, Cutadapt, and Minimap2 into a single command, annotating output BAM files with strand-of-origin tags for downstream isoform analysis.
+Read directionalization, trimming, and alignment pipeline for long-read transcriptomics. Wraps PyChopper, Cutadapt, and Minimap2 into a single command, annotating output BAM files with strand-of-origin tags for downstream isoform analysis. Can be run for non-ONT reads by omitting the 'pyc' arguments.
 
 ### Inputs
 
@@ -101,7 +101,7 @@ python3 AccuMap.py \
 
 ## IsoClassifier
 
-Classifies reads overlapping structurally intact LTR retrotransposons into isoform categories (left-LTR, right-LTR, spanning, read-over-5', read-over-3') and summarizes gene-level read counts and TSS positions. Uses interval trees to identify and exclude reads originating from nested transposable elements. Parallelizes classification by chromosome.
+Classifies reads overlapping structurally intact LTR retrotransposons into isoform categories (left-LTR(5'), right-LTR(3'), spanning(coding), read-through-5', read-through-3') and summarizes gene-level read counts and TSS positions. Uses interval trees to identify and exclude reads originating from nested transposable elements. Parallelizes classification by chromosome.
 
 ### Inputs
 
