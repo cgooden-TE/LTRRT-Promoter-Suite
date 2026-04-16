@@ -36,9 +36,8 @@ import math
 import re
 import sqlite3
 from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
-from statistics import mean, pstdev, median
-from scipy import stats
+
+
 import random
 import bisect
 
@@ -506,162 +505,6 @@ def frac_bases(seq: str, allowed: set) -> float:
     return sum(1 for b in seq if b in allowed) / len(seq)
 
 
-# ------------------------------
-# Troubleshooting Functions
-# ------------------------------
-def at_fraction(s: str) -> float:
-    if not s:
-        return 0.0
-    s = s.upper()
-    return (s.count("A") + s.count("T")) / len(s)
-
-def ta_fraction(s: str) -> float:
-    if len(s) < 2:
-        return 0.0
-    s = s.upper()
-    ta = sum(1 for a, b in zip(s[:-1], s[1:]) if a == "T" and b == "A")
-    return ta / (len(s) - 1)
-
-def mono_shuffle(win: str, rng: random.Random) -> str:
-    s = list(win)
-    rng.shuffle(s)
-    return "".join(s)
-
-def dinuc_shuffle(win: str, rng: random.Random) -> str:
-    """
-    Dinucleotide-preserving shuffle for A/C/G/T-only strings.
-    Uses randomized Hierholzer traversal on the implied multigraph.
-    """
-    if len(win) < 2:
-        return win
-    win = win.upper()
-    # Guard: you said no ambiguous bases
-    for ch in win:
-        if ch not in "ACGT":
-            raise ValueError(f"dinuc_shuffle: non-ACGT base found: {ch}")
-
-    adj = defaultdict(list)
-    for a, b in zip(win[:-1], win[1:]):
-        adj[a].append(b)
-    for a in adj:
-        rng.shuffle(adj[a])
-
-    start = win[0]
-    stack = [start]
-    path = []
-    while stack:
-        v = stack[-1]
-        if adj[v]:
-            stack.append(adj[v].pop())
-        else:
-            path.append(stack.pop())
-    path.reverse()
-    out = "".join(path)
-    if len(out) != len(win):
-        raise RuntimeError("dinuc_shuffle produced incorrect length")
-    return out
-
-def window_scan_summary_local(win: str, pwm, bg, threshold: float):
-    """Scan a window string directly, return hit count + best score."""
-    hits = scan_all_pwm_hits(win, pwm, bg, start=0, end=len(win), threshold=threshold)
-    if not hits:
-        return 0, None
-    best = max(h[2] for h in hits)
-    return len(hits), best
-
-def shuffle_control_for_window_fast(seq: str, pwm, bg,
-                                    start: int, end: int,
-                                    threshold: float,
-                                    n_shuffles: int,
-                                    rng,
-                                    mode: str = "mono"):
-    start = max(0, start)
-    end = min(len(seq), end)
-    if end <= start:
-        return None
-
-    win = seq[start:end]
-    # real
-    real_n, real_best = window_scan_summary_local(win, pwm, bg, threshold)
-
-    # streaming mean/variance (Welford), ignoring "no hit" shuffles for score stats
-    n_finite = 0
-    mu = 0.0
-    m2 = 0.0
-    n_hit_shuf = 0
-
-    for _ in range(n_shuffles):
-        if mode == "mono":
-            win_shuf = mono_shuffle(win, rng)
-        elif mode in ("di", "dinuc"):
-            win_shuf = dinuc_shuffle(win, rng) if len(win) >= 2 else win
-        else:
-            raise ValueError("mode must be 'mono' or 'di'/'dinuc'")
-
-        sh_n, sh_best = window_scan_summary_local(win_shuf, pwm, bg, threshold)
-        if sh_n > 0:
-            n_hit_shuf += 1
-        if sh_best is None:
-            continue
-
-        n_finite += 1
-        delta = sh_best - mu
-        mu += delta / n_finite
-        m2 += delta * (sh_best - mu)
-
-    sd = math.sqrt(m2 / n_finite) if n_finite > 1 else 0.0
-    z = None
-    if real_best is not None and n_finite > 1 and sd > 0:
-        z = (real_best - mu) / sd
-
-    return {
-        "start": start, "end": end,
-        "window_len": len(win),
-        "window_AT": at_fraction(win),
-        "window_TA": ta_fraction(win),
-        "real_n_hits": real_n,
-        "real_best_score": real_best,
-        "shuffle_hit_rate": (n_hit_shuf / n_shuffles) if n_shuffles else 0.0,
-        "shuffle_best_mean": (mu if n_finite else None),
-        "shuffle_best_sd": (sd if n_finite else None),
-        "best_z": z,
-        "mode": mode,
-    }
-    
-def spearman_corr(xs, ys):
-    try:
-        from scipy.stats import spearmanr
-        r, p = spearmanr(xs, ys, nan_policy="omit")
-        return r, p
-    except ImportError:
-        # lightweight fallback: rank then Pearson (no p-value)
-        def rankdata(a):
-            tmp = sorted((v, i) for i, v in enumerate(a))
-            ranks = [0.0] * len(a)
-            i = 0
-            while i < len(tmp):
-                j = i
-                while j < len(tmp) and tmp[j][0] == tmp[i][0]:
-                    j += 1
-                avg = (i + 1 + j) / 2.0
-                for k in range(i, j):
-                    ranks[tmp[k][1]] = avg
-                i = j
-            return ranks
-
-        def pearson(x, y):
-            n = len(x)
-            mx = sum(x) / n
-            my = sum(y) / n
-            num = sum((a - mx) * (b - my) for a, b in zip(x, y))
-            denx = math.sqrt(sum((a - mx) ** 2 for a in x))
-            deny = math.sqrt(sum((b - my) ** 2 for b in y))
-            return num / (denx * deny) if denx and deny else float("nan")
-
-        rx = rankdata(xs)
-        ry = rankdata(ys)
-        return pearson(rx, ry), None
-
 
 # ------------------------------
 # Argument parsing
@@ -852,28 +695,7 @@ def main():
 
 
     total_tests = 0
-    prim_best_scores = []
-    sec_best_scores  = []
 
-    prim_z_scores = []
-    sec_z_scores  = []
-
-    prim_at = []
-    prim_ta = []
-    prim_best = []
-    sec_at  = []
-    sec_ta = []
-    sec_best = []
-
-    n_prim_total = 0
-    n_sec_total  = 0
-    n_prim_hit   = 0
-    n_sec_hit    = 0
-    top_sec = []   # list of tuples (best_score, feat, AT, Z)
-    TOP_N = 10
-    
-    rng = random.Random(12345)
-    
     for rec in SeqIO.parse(args.ltr_fasta, 'fasta'):
         feat, chrom, ltr_s, ltr_e, strand = parse_header(rec.id)
         if feat not in u3_map or feat not in tss_map:
@@ -1060,102 +882,6 @@ def main():
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (feat, 'DPE7', pwm_len(pwms['DPE7']), s_rel, e_rel, s_abs, e_abs, 
                   score, subseq, dist, 0, yc, dpe_band_start, dpe_band_end, pval))
-            
-        # Trouble shooting TATA and SEC TATA 
-
-        prim_mono = shuffle_control_for_window_fast(
-            seq, pwms["TATA"], bg, up_start, up_end, scan_thr["TATA"],
-            n_shuffles=100, rng=rng, mode="mono"
-        )
-        prim_di = shuffle_control_for_window_fast(
-            seq, pwms["TATA"], bg, up_start, up_end, scan_thr["TATA"],
-            n_shuffles=50, rng=rng, mode="di"
-        )
-
-        sec_mono = shuffle_control_for_window_fast(
-            seq, pwms["TATA"], bg, sec_band_start, sec_band_end, scan_thr["SEC_TATA"],
-            n_shuffles=100, rng=rng, mode="mono"
-        )
-        sec_di = shuffle_control_for_window_fast(
-            seq, pwms["TATA"], bg, sec_band_start, sec_band_end, scan_thr["SEC_TATA"],
-            n_shuffles=50, rng=rng, mode="di"
-        )
-
-        # after you compute prim_mono and sec_mono (or prim_di/sec_di, choose one consistently)
-        n_prim_total += 1
-        n_sec_total  += 1
-
-        if prim_mono and prim_mono["real_best_score"] is not None:
-            prim_at.append(prim_mono["window_AT"])
-            prim_ta.append(prim_mono["window_TA"])
-            prim_best.append(prim_mono["real_best_score"])
-            n_prim_hit += 1
-            prim_best_scores.append(prim_mono["real_best_score"])
-            if prim_mono["best_z"] is not None:
-                prim_z_scores.append(prim_mono["best_z"])
-
-        if sec_mono and sec_mono["real_best_score"] is not None:
-            sec_at.append(sec_mono["window_AT"])
-            sec_ta.append(sec_mono["window_TA"])
-            sec_best.append(sec_mono["real_best_score"])
-            n_sec_hit += 1
-            sec_best_scores.append(sec_mono["real_best_score"])
-            # keep top N secondary hits by score for inspection
-            top_sec.append((sec_mono["real_best_score"], feat, sec_mono["window_AT"], sec_mono["best_z"]))
-            if sec_mono["best_z"] is not None:
-                sec_z_scores.append(sec_mono["best_z"])
-
-
-    def print_spearman(label, xs, ys):
-        # Need at least 3 points to be meaningful
-        if len(xs) < 3 or len(ys) < 3:
-            print(f"{label} Spearman: not enough points (n={min(len(xs), len(ys))})")
-            return
-        r, p = spearman_corr(xs, ys)
-        # If you’re using the fallback spearman without scipy, p will be None
-        if p is None:
-            print(f"{label} Spearman rho={r:.3f} (p-value unavailable; install scipy for p)")
-        else:
-            print(f"{label} Spearman rho={r:.3f}, p={p:.3g} (n={min(len(xs), len(ys))})")
-
-    print("\n=== Correlations (best score vs composition) ===")
-    print_spearman("Primary: AT% vs best-score", prim_at, prim_best)
-    print_spearman("Primary: TA% vs best-score", prim_ta, prim_best)
-    print_spearman("Secondary: AT% vs best-score", sec_at, sec_best)
-    print_spearman("Secondary: TA% vs best-score", sec_ta, sec_best)
-
-    def summarize(label, scores, zs, ats, n_total, n_hit):
-        print(f"\n=== {label} summary ===")
-        print(f"Loci scanned: {n_total}")
-        print(f"Loci with >=1 hit: {n_hit} ({(n_hit/n_total*100 if n_total else 0):.2f}%)")
-
-        if scores:
-            print(f"Best-score mean:   {mean(scores):.3f}")
-            print(f"Best-score median: {median(scores):.3f}")
-            print(f"Best-score sd:     {pstdev(scores):.3f}")
-        else:
-            print("No hits -> no score summary")
-
-        if zs:
-            print(f"Z mean:   {mean(zs):.3f}")
-            print(f"Z median: {median(zs):.3f}")
-            print(f"Z sd:     {pstdev(zs):.3f}")
-        else:
-            print("No finite Z values to summarize")
-
-        if ats:
-            print(f"AT% mean (window): {mean(ats):.3f}")
-        else:
-            print("No AT% values collected")
-
-    summarize("Primary (mono)", prim_best_scores, prim_z_scores, prim_at, n_prim_total, n_prim_hit)
-    summarize("Secondary (mono)", sec_best_scores, sec_z_scores, sec_at, n_sec_total, n_sec_hit)
-
-    # optional: show top N secondary hits
-    top_sec.sort(reverse=True, key=lambda x: x[0])
-    print(f"\nTop {min(TOP_N, len(top_sec))} secondary hits (by best score):")
-    for sc, feat, atv, z in top_sec[:TOP_N]:
-        print(f"  {feat}\tscore={sc:.3f}\tAT%={atv:.3f}\tZ={z}")
 
     def compute_and_store_percentile_cutoffs(conn, perc: float):
         cur = conn.cursor()
