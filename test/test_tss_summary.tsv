@@ -1,0 +1,3 @@
+Feature	Top_Isoform	Top_Isoform_Strand	Total_Reads	TSS1	Count1	TSS2	Count2
+repeat_region_762	ro3	-	4	521486	3	521569	1
+repeat_region_769	ltr_left	+	8	783373	3	782960	1

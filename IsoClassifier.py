@@ -24,6 +24,7 @@ Example Usage:
         --gene_out gene_summary.tsv
 """
 import argparse
+import logging
 import time
 from collections import Counter, defaultdict
 from multiprocessing import Pool
@@ -31,6 +32,9 @@ import pandas as pd
 import pysam
 import numpy as np
 from intervaltree import IntervalTree
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -50,6 +54,9 @@ def parse_args():
                         help='Output file for LTR isoform TSS summary')
     parser.add_argument('--gene_out', required=True,
                         help='Output file for gene read counts and TSS summary')
+    parser.add_argument('--genome-fasta', dest='genome_fasta', default=None,
+                        help='Genome FASTA for U3/promoter sequence extraction '
+                             '(enables u3_seq_extraction after classification)')
     return parser.parse_args()
 
 # Helper function to parse GFF attributes into a dictionary
@@ -355,16 +362,22 @@ def init_worker(elem_info, gene_info, full_tree, nested_tree, gene_tree):
     _GLOBAL_NESTED_TREE = nested_tree
     _GLOBAL_GENE_TREE = gene_tree
 
-def _classify_chrom(chrom, bam_paths, min_mapq):
-    """Process all primary reads on *chrom* across every BAM."""
-    
+def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_paths, min_mapq):
+    """Process primary reads whose alignment starts in [claim_start, claim_end) on *chrom*.
+
+    Reads are fetched from [fetch_start, fetch_end) (which may extend past the claim
+    bounds by the overlap margin so reads straddling a chunk boundary are still seen),
+    but only reads with reference_start inside [claim_start, claim_end) are counted —
+    that is the deduplication rule across adjacent chunks.
+    """
+
     # Access the massive data structures directly from global memory (zero pickling overhead)
     elem_info = _GLOBAL_ELEM_INFO
     gene_info = _GLOBAL_GENE_INFO
     full_tree_chrom = _GLOBAL_FULL_TREE.get(chrom, None)
     nested_tree_chrom = _GLOBAL_NESTED_TREE.get(chrom, None)
     gene_tree_chrom = _GLOBAL_GENE_TREE.get(chrom, None)
-    
+
     # Fast path: if this chromosome has strictly zero trees in the GFF, skip entirely.
     if not full_tree_chrom and not nested_tree_chrom and not gene_tree_chrom:
         return {
@@ -409,14 +422,21 @@ def _classify_chrom(chrom, bam_paths, min_mapq):
 
     for path in bam_paths:
         bf = pysam.AlignmentFile(path, 'rb')
-        # Only iterate reads on this chromosome
+        # Iterate reads overlapping this chunk's fetch window (includes overlap margin)
         try:
-            read_iter = bf.fetch(contig=chrom)
+            read_iter = bf.fetch(contig=chrom, start=fetch_start, end=fetch_end)
         except ValueError:
             bf.close()
             continue
 
         for read in read_iter:
+            # Claim rule: only count reads whose alignment starts within this chunk's
+            # claim bounds. Reads in the overlap margin are seen here but claimed by
+            # the neighbouring chunk, so they are skipped.
+            rs = read.reference_start
+            if rs < claim_start or rs >= claim_end:
+                continue
+
             n_reads += 1
 
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
@@ -593,7 +613,7 @@ def _classify_chrom(chrom, bam_paths, min_mapq):
         bf.close()
 
     elapsed = time.time() - t0
-    print(f"  {chrom}: {n_reads} reads processed in {elapsed:.1f}s")
+    print(f"  {chrom}:{claim_start}-{claim_end}: {n_reads} reads processed in {elapsed:.1f}s")
 
     return {
         'chrom': chrom,
@@ -617,13 +637,37 @@ def _classify_chrom(chrom, bam_paths, min_mapq):
 def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_info,
                            gene_tree, bam_paths, min_mapq, clip_out_splice=None,
                            clip_out_nonsplice=None, ltr_exon_out=None, gene_exon_out=None,
-                           n_threads=1):
+                           n_threads=1, chunk_size=1_000_000, overlap=10_000):
     cats = _CATS
 
-    # Discover chromosomes present in the BAMs
-    chroms = sorted({ref for p in bam_paths
-                     for ref in pysam.AlignmentFile(p, 'rb').references})
-    print(f"Dispatching {len(chroms)} chromosomes across {n_threads} process(es)...")
+    # Discover chromosome sizes from BAM headers (union across all BAMs, max length wins
+    # if a contig appears with different lengths).
+    chrom_sizes = {}
+    for p in bam_paths:
+        bf = pysam.AlignmentFile(p, 'rb')
+        for ref, length in zip(bf.references, bf.lengths):
+            chrom_sizes[ref] = max(chrom_sizes.get(ref, 0), length)
+        bf.close()
+
+    # Shard each chromosome into fixed-size chunks with an overlap margin on the fetch
+    # range. Claim bounds are non-overlapping so no read is double-counted.
+    chunks = []
+    for chrom in sorted(chrom_sizes):
+        length = chrom_sizes[chrom]
+        if length <= 0:
+            continue
+        pos = 0
+        while pos < length:
+            claim_start = pos
+            claim_end = min(pos + chunk_size, length)
+            fetch_start = max(0, claim_start - overlap)
+            fetch_end = min(length, claim_end + overlap)
+            chunks.append((chrom, claim_start, claim_end, fetch_start, fetch_end,
+                           bam_paths, min_mapq))
+            pos = claim_end
+
+    print(f"Dispatching {len(chunks)} chunks ({chunk_size // 1000} kb each, "
+          f"{overlap // 1000} kb overlap) across {n_threads} process(es)...")
 
     start_time = time.time()
 
@@ -638,20 +682,16 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
     _GLOBAL_NESTED_TREE = nested_tree
     _GLOBAL_GENE_TREE = gene_tree
 
-    # Build argument tuples - ONLY strings and integers! (Bypasses Pickling bottlenecks natively!)
-    args_list = [
-        (chrom, bam_paths, min_mapq)
-        for chrom in chroms
-    ]
-
     if n_threads > 1:
-        with Pool(processes=n_threads, 
-                  initializer=init_worker, 
-                  initargs=(_GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, 
+        with Pool(processes=n_threads,
+                  initializer=init_worker,
+                  initargs=(_GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO,
                             _GLOBAL_FULL_TREE, _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE)) as pool:
-            results = pool.starmap(_classify_chrom, args_list)
+            # chunksize=1 so each worker grabs the next chunk as it finishes,
+            # which balances load when chunks vary in read density.
+            results = pool.starmap(_classify_chunk, chunks, chunksize=1)
     else:
-        results = [_classify_chrom(*a) for a in args_list]
+        results = [_classify_chunk(*a) for a in chunks]
 
     # Merge per-chromosome results -----------------------------------------
     strand_counts = Counter()
@@ -958,6 +998,191 @@ def write_gene_summary_top_n(gene_stats, gene_tss, out_path, n=10):
             out.write("\t".join(row) + "\n")
 
     print(f"Wrote top-{n} gene TSS summary to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# U3 / Promoter Sequence Extraction
+# ---------------------------------------------------------------------------
+def _extract_region(chrom_seq, start1, end1, strand):
+    """
+    Extract 1-based inclusive [start1, end1] from chrom_seq (a Bio.Seq.Seq)
+    and reverse-complement if strand == '-'.
+    """
+    seq = chrom_seq[start1 - 1:end1]
+    return seq.reverse_complement() if strand == '-' else seq
+
+
+def u3_seq_extraction(genome_fasta, elem_info, gene_info,
+                      stats, tss_positions, gene_tss, gene_stats,
+                      output_prefix):
+    """
+    Extract U3/LTR sequences for LTR elements and promoter regions for genes.
+
+    Reuses the data structures already computed by IsoClassifier:
+      - elem_info  : dict of LTR element metadata (0-based coords)
+      - gene_info  : dict of gene metadata (0-based coords)
+      - stats / tss_positions : per-element classification results
+      - gene_tss / gene_stats : per-gene TSS positions and read counts
+
+    LTR mode outputs:
+      <prefix>_u3_seqs.fa   — U3 region sequences
+      <prefix>_ltr_seqs.fa  — Full LTR sequences (TSS-containing LTR)
+
+    Gene mode outputs:
+      <prefix>_gene_2kb_proms.bed  — BED of ±1000 bp around primary TSS
+      <prefix>_gene_2kb_proms.fa   — Strand-aware FASTA of promoter regions
+      <prefix>_gene_dummy_u3.fa    — Dummy U3 FASTA (NNNNN) for upstream 1 kb
+    """
+    print("Loading genome FASTA for U3/promoter extraction...")
+    genome = SeqIO.to_dict(SeqIO.parse(genome_fasta, 'fasta'))
+    print(f"Loaded {len(genome)} sequences from genome FASTA.")
+
+    # ---- LTR mode ----
+    u3_records = []
+    ltr_records = []
+
+    for eid, rec in stats.items():
+        total = rec.get('total', 0)
+        if total == 0:
+            continue
+
+        element = elem_info.get(eid)
+        if not element:
+            continue
+
+        chrom = element['chrom']
+        strand = element.get('strand', '.')
+
+        # Determine strand fallback from top isoform
+        top_cat = max(rec['counts'], key=rec['counts'].get)
+        if strand not in ('+', '-'):
+            strand_list = rec.get('strands', {}).get(top_cat, [])
+            scounts = Counter(s for s in strand_list if s in ('+', '-'))
+            if scounts:
+                strand = scounts.most_common(1)[0][0]
+            else:
+                logging.warning(f"[U3] No valid strand for {eid}; skipping")
+                continue
+
+        # Get primary TSS (0-based from IsoClassifier)
+        common = Counter(tss_positions[eid][top_cat]).most_common(1)
+        if not common:
+            continue
+        tss0 = common[0][0]   # 0-based
+        tss1 = tss0 + 1       # convert to 1-based for sequence extraction
+
+        ltr_left = element.get('ltr_left')    # (start0, end0) 0-based half-open
+        ltr_right = element.get('ltr_right')
+        if not ltr_left or not ltr_right:
+            continue
+
+        # Determine which LTR contains the TSS (using 0-based coords)
+        chosen = None
+        if ltr_left[0] <= tss0 < ltr_left[1]:
+            chosen = ltr_left
+        elif ltr_right[0] <= tss0 < ltr_right[1]:
+            chosen = ltr_right
+
+        if not chosen:
+            logging.warning(f"[U3] TSS {tss0} not in lLTR or rLTR of {eid}; skipping")
+            continue
+
+        chrom_rec = genome.get(chrom)
+        if not chrom_rec:
+            logging.warning(f"[U3] Chrom {chrom} not in genome; skipping {eid}")
+            continue
+
+        # U3 boundary: from inner edge of LTR to TSS
+        # On '+': boundary = chosen[0] (0-based start), convert to 1-based = chosen[0]+1
+        # On '-': boundary = chosen[1] (0-based half-open end), 1-based = chosen[1]
+        boundary1 = (chosen[0] + 1) if strand == '+' else chosen[1]
+        u3_start1, u3_end1 = sorted((tss1, boundary1))
+
+        u3_seq = _extract_region(chrom_rec.seq, u3_start1, u3_end1, strand)
+        u3_hdr = f"{eid}|{chrom}:{u3_start1}-{u3_end1}({strand})"
+        u3_records.append(SeqRecord(u3_seq, id=u3_hdr, description=""))
+
+        # Full LTR (same side as TSS), convert 0-based half-open to 1-based inclusive
+        full_start1 = chosen[0] + 1
+        full_end1 = chosen[1]
+        full_seq = _extract_region(chrom_rec.seq, full_start1, full_end1, strand)
+        ltr_hdr = f"{eid}|{chrom}:{full_start1}-{full_end1}({strand})"
+        ltr_records.append(SeqRecord(full_seq, id=ltr_hdr, description=""))
+
+    u3_out = output_prefix + '_u3_seqs.fa'
+    ltr_out = output_prefix + '_ltr_seqs.fa'
+    SeqIO.write(u3_records, u3_out, 'fasta')
+    print(f"[U3-LTR] Wrote {len(u3_records)} U3 sequences to {u3_out}")
+    SeqIO.write(ltr_records, ltr_out, 'fasta')
+    print(f"[U3-LTR] Wrote {len(ltr_records)} full LTR sequences to {ltr_out}")
+
+    # ---- Gene mode ----
+    gene_u3_records = []
+    promoter_records = []
+    n_written = 0
+
+    bed_path = output_prefix + '_gene_2kb_proms.bed'
+    prom_fa_path = output_prefix + '_gene_2kb_proms.fa'
+    gene_u3_path = output_prefix + '_gene_dummy_u3.fa'
+
+    with open(bed_path, 'w') as bed_out:
+        for gid, positions in gene_tss.items():
+            if not positions:
+                continue
+            grec = gene_stats.get(gid, {})
+            if grec.get('total', 0) == 0:
+                continue
+
+            ginfo = gene_info.get(gid)
+            if not ginfo:
+                continue
+
+            chrom = ginfo['chrom']
+            strand = ginfo['strand']
+            if strand not in ('+', '-'):
+                logging.warning(f"[Gene] {gid} has invalid strand '{strand}'; skipping")
+                continue
+
+            chrom_rec = genome.get(chrom)
+            if not chrom_rec:
+                logging.warning(f"[Gene] Chrom {chrom} not in genome; skipping {gid}")
+                continue
+            chrom_len = len(chrom_rec.seq)
+
+            # Primary TSS (0-based from IsoClassifier)
+            tss0 = Counter(positions).most_common(1)[0][0]
+            tss1 = tss0 + 1  # 1-based
+
+            # Promoter: ±1000 bp around TSS (genomic coords)
+            prom_start0 = max(0, tss1 - 1000)      # 0-based start
+            prom_end1 = min(tss1 + 1000, chrom_len) # 1-based end
+
+            # BED line (0-based start, half-open end)
+            bed_out.write(f"{chrom}\t{prom_start0}\t{prom_end1}\t{gid}\t0\t{strand}\n")
+
+            # Promoter FASTA (strand-aware)
+            prom_start1 = prom_start0 + 1
+            prom_seq = _extract_region(chrom_rec.seq, prom_start1, prom_end1, strand)
+            prom_hdr = f"{gid}|{chrom}:{prom_start0}-{prom_end1}({strand})"
+            promoter_records.append(SeqRecord(prom_seq, id=prom_hdr, description=""))
+
+            # Dummy U3: upstream 1 kb header with NNNNN sequence
+            if strand == '+':
+                u3_start0 = max(0, tss1 - 1000)
+                u3_end1_g = tss1
+            else:
+                u3_start0 = tss1
+                u3_end1_g = min(tss1 + 1000, chrom_len)
+
+            u3_hdr = f"{gid}|{chrom}:{u3_start0}-{u3_end1_g}({strand})"
+            gene_u3_records.append(SeqRecord(Seq("NNNNN"), id=u3_hdr, description=""))
+            n_written += 1
+
+    SeqIO.write(promoter_records, prom_fa_path, 'fasta')
+    print(f"[Gene] Wrote {n_written} promoter entries to {bed_path} and {prom_fa_path}")
+    SeqIO.write(gene_u3_records, gene_u3_path, 'fasta')
+    print(f"[Gene] Wrote {n_written} dummy U3 sequences to {gene_u3_path}")
+
     
 # Computes TSS density for histograms around the primary and secondary TSS for each feature, 
 # with strand-aware distances and optional inclusion of reads at the TSS.
@@ -1161,10 +1386,19 @@ def main():
 
     write_tsv(elem_info, stats, args.output)
     write_isoform_tss_summary(stats, tss_positions, args.tss_out)
-    write_isoform_tss_summary_top_n(stats, tss_positions,end_positions,
-                                    cleave_out_path="10site.ltr_cleavage_summary.tsv", tss_out_path="10site.ltr_tss_summary.tsv",n=10)
+    write_isoform_tss_summary_top_n(stats, tss_positions, end_positions,
+                                    cleave_out_path=args.output + "_10site.ltr_cleavage_summary.tsv",
+                                    tss_out_path=args.output + "_10site.ltr_tss_summary.tsv",
+                                    n=10)
     write_gene_summary(gene_stats, gene_tss, args.gene_out)
-    write_gene_summary_top_n(gene_stats,gene_tss,out_path="10site.gene_summary.tsv",n=10)
+    write_gene_summary_top_n(gene_stats, gene_tss,
+                             out_path=args.output + "_10site.gene_summary.tsv",
+                             n=10)
+
+    if args.genome_fasta:
+        u3_seq_extraction(args.genome_fasta, elem_info, gene_info,
+                          stats, tss_positions, gene_tss, gene_stats,
+                          args.output)
 
 if __name__ == '__main__':
     main()
