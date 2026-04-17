@@ -8,7 +8,7 @@ All files are derived from a 1 Mb region of maize B73 chromosome 1 (original coo
 
 | File | Description |
 |------|-------------|
-| `test_reads.fastq` | 200 ONT cDNA reads (untrimmed, raw) |
+| `test_reads.fastq` | 212 ONT cDNA reads (untrimmed, raw); includes reads aligning to two structural LTR-RTs so IsoClassifier emits non-empty U3/LTR FASTA outputs |
 | `test_reference.fa` | 1 Mb reference genome subset (B73 chr1) |
 | `test_annotations.gff` | TE and gene annotations (658 features including 30 structural LTR-RTs, 25 genes) |
 | `test_ltr_seqs.fa` | Full LTR sequences for 2 elements with expression data |

@@ -93,59 +93,78 @@ echo ""
 # -------------------------------------------------------
 # Step 3: WindowScrubber
 # -------------------------------------------------------
-# WindowScrubber requires LTR/U3 FASTA and TSS data.
-# Use the pre-built test files (from real data) rather than
-# IsoClassifier output, since the small read set may not
-# produce sufficient LTR classifications.
+# WindowScrubber is run twice against the IsoClassifier outputs:
+#   - LTR-RT elements  (u3_seqs.fa / ltr_seqs.fa / ltr_tss_summary.tsv)
+#   - Gene promoters   (gene_dummy_u3.fa / gene_2kb_proms.fa / gene_summary.tsv)
 echo "---------------------------------------------"
-echo " Step 3: WindowScrubber"
+echo " Step 3: WindowScrubber (LTR-RTs)"
 echo "---------------------------------------------"
 python3 "$SUITE_DIR/WindowScrubber.py" \
-    -l "$SCRIPT_DIR/test_ltr_seqs.fa" \
-    -u3 "$SCRIPT_DIR/test_u3_seqs.fa" \
-    -t "$SCRIPT_DIR/test_tss_summary.tsv" \
-    -db "$OUT_DIR/test_motif_hits.db"
+    -l "$OUT_DIR/test_ltr_isoforms_ltr_seqs.fa" \
+    -u3 "$OUT_DIR/test_ltr_isoforms_u3_seqs.fa" \
+    -t "$OUT_DIR/test_ltr_tss_summary.tsv" \
+    -db "$OUT_DIR/test_ltr_motif_hits.db"
 
-if [ ! -f "$OUT_DIR/test_motif_hits.db" ]; then
-    echo "ERROR: WindowScrubber did not produce expected database."
+if [ ! -s "$OUT_DIR/test_ltr_motif_hits.db" ]; then
+    echo "ERROR: WindowScrubber did not produce LTR motif database."
     exit 1
 fi
-echo "WindowScrubber completed successfully."
+echo "WindowScrubber (LTR-RTs) completed successfully."
+echo ""
+
+echo "---------------------------------------------"
+echo " Step 3b: WindowScrubber (Genes)"
+echo "---------------------------------------------"
+python3 "$SUITE_DIR/WindowScrubber.py" \
+    -l "$OUT_DIR/test_ltr_isoforms_gene_2kb_proms.fa" \
+    -u3 "$OUT_DIR/test_ltr_isoforms_gene_dummy_u3.fa" \
+    -t "$OUT_DIR/test_gene_summary.tsv" \
+    -db "$OUT_DIR/test_gene_motif_hits.db"
+
+if [ ! -s "$OUT_DIR/test_gene_motif_hits.db" ]; then
+    echo "ERROR: WindowScrubber did not produce gene motif database."
+    exit 1
+fi
+echo "WindowScrubber (Genes) completed successfully."
 echo ""
 
 # -------------------------------------------------------
-# Step 4: Query_WSDB
+# Step 4: Query_WSDB (run against both LTR and gene databases)
 # -------------------------------------------------------
 echo "---------------------------------------------"
 echo " Step 4: Query_WSDB"
 echo "---------------------------------------------"
 
-echo "  4a. Database statistics:"
-python3 "$SUITE_DIR/Query_WSDB.py" \
-    -db "$OUT_DIR/test_motif_hits.db" \
-    --stats
+for TAG in ltr gene; do
+    DB="$OUT_DIR/test_${TAG}_motif_hits.db"
+    echo ""
+    echo "== Query_WSDB against $TAG database =="
 
-echo ""
-echo "  4b. Best TATA per element:"
-python3 "$SUITE_DIR/Query_WSDB.py" \
-    -db "$OUT_DIR/test_motif_hits.db" \
-    --best-per-element TATA \
-    --order-by score \
-    -o "$OUT_DIR/test_best_tata.tsv"
+    echo "  4a. Database statistics:"
+    python3 "$SUITE_DIR/Query_WSDB.py" -db "$DB" --stats
 
-echo ""
-echo "  4c. Best hits for all motifs (wide format):"
-python3 "$SUITE_DIR/Query_WSDB.py" \
-    -db "$OUT_DIR/test_motif_hits.db" \
-    --best-all-motifs \
-    -o "$OUT_DIR/test_best_all_motifs.tsv"
+    echo ""
+    echo "  4b. Best TATA per element:"
+    python3 "$SUITE_DIR/Query_WSDB.py" \
+        -db "$DB" \
+        --best-per-element TATA \
+        --order-by score \
+        -o "$OUT_DIR/test_${TAG}_best_tata.tsv"
 
-echo ""
-echo "  4d. CA dinucleotide summary:"
-python3 "$SUITE_DIR/Query_WSDB.py" \
-    -db "$OUT_DIR/test_motif_hits.db" \
-    --ca-summary \
-    -o "$OUT_DIR/test_ca_runs.tsv"
+    echo ""
+    echo "  4c. Best hits for all motifs (wide format):"
+    python3 "$SUITE_DIR/Query_WSDB.py" \
+        -db "$DB" \
+        --best-all-motifs \
+        -o "$OUT_DIR/test_${TAG}_best_all_motifs.tsv"
+
+    echo ""
+    echo "  4d. CA dinucleotide summary:"
+    python3 "$SUITE_DIR/Query_WSDB.py" \
+        -db "$DB" \
+        --ca-summary \
+        -o "$OUT_DIR/test_${TAG}_ca_runs.tsv"
+done
 
 echo "Query_WSDB completed successfully."
 echo ""
