@@ -1,7 +1,7 @@
 # LTRRT-Promoter-Suite
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19634858.svg)](https://doi.org/10.5281/zenodo.19634858)
 
-A suite of tools for characterizing the U3 promoter regions and transcription events of long terminal repeat retrotransposons (LTR-RTs) in maize.
+Tools developed to characterize the U3 promoter regions and transcription events of long terminal repeat retrotransposons.
 
 ---
 
