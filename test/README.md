@@ -36,3 +36,40 @@ Output is written to `test/output/`. The test should complete in under 5 minutes
 ```bash
 rm -rf test/output/
 ```
+
+---
+
+## Inspecting Published Results
+
+`test/` also contains two result objects from the full LTR-RT analysis in maize. These are independent of the test run and require the DECLTR R environment.
+
+**Activate the environment:**
+
+```bash
+conda activate DECLTR-env
+R
+```
+
+**DECLTR results** (`DECLTR_results.qs`) — labeled output data frame from the DECLTR filtering pipeline:
+
+```r
+library(qs)
+decltr <- qread("test/DECLTR_results.qs")
+head(decltr)
+colnames(decltr)
+```
+
+**WGCNA results** (`WGCNA_results.rds`) — named list with network and module data:
+
+```r
+wgcna <- readRDS("test/WGCNA_results.rds")
+names(wgcna)
+# $bwnet         — blockwiseModules output object
+# $moduleColors  — per-gene module color assignments
+# $mes           — module eigengenes (sample × module matrix)
+# $traits        — trait/metadata matrix used for correlations
+# $datExpr       — VST-normalized expression matrix (samples × genes)
+# $softpwr       — soft-thresholding power selected for network construction
+```
+
+Run these commands from the `LTRRT-Promoter-Suite/` repo root, or adjust paths accordingly.
