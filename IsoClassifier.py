@@ -77,7 +77,13 @@ def load_elements_and_ranges(gff_path):
     full_df   = df[df['feature'].str.contains('LTR_retrotransposon', na=False)]
     ltr_df    = df[df['feature']=='long_terminal_repeat']
     gene_df   = df[df['feature']=='gene']
-    nested_df = df.drop(full_df.index).drop(ltr_df.index).drop(gene_df.index)
+    # EDTA emits each element's own container (repeat_region) and flanking TSDs as
+    # separate rows that SPAN the whole element (incl. both LTRs). They are the element
+    # itself, not foreign "nested" insertions; leaving them in nested_df makes the
+    # nested-read filter drop every LTR-originating read. Exclude them so a raw EDTA
+    # TEanno.gff3 can be used directly (no need to pre-strip rows from the file).
+    struct_df = df[df['feature'].isin(['repeat_region','target_site_duplication'])]
+    nested_df = df.drop(full_df.index).drop(ltr_df.index).drop(gene_df.index).drop(struct_df.index)
 
     element_info = {}
     gene_info = {}
@@ -126,8 +132,14 @@ def load_elements_and_ranges(gff_path):
             elif lid.startswith('r'):
                 element_info[eid]['ltr_right'] = (s, e)
 
-    print(f"Found {len(element_info)} LTR elements; "
-          f"{sum(1 for v in element_info.values() if v['ltr_left'] and v['ltr_right'])} have both LTRs.")
+    both = sum(1 for v in element_info.values() if v['ltr_left'] and v['ltr_right'])
+    print(f"Found {len(element_info)} LTR elements; {both} have both LTRs.")
+    if not element_info:
+        print("WARNING: no LTR_retrotransposon rows with a Parent= attribute were found — "
+              "LTR outputs will be empty (the GFF needs structural LTR-RT entries).")
+    elif both == 0:
+        print("WARNING: 0 elements have both 5'/3' LTRs — no 'long_terminal_repeat' rows with "
+              "l../r..-prefixed IDs matched their Parent. LTR classification will be empty.")
     print("Indexing intervals with intervaltree...")
 
     full_tree      = defaultdict(IntervalTree)
@@ -844,8 +856,10 @@ def write_tsv(elem_info, stats, prefix, qual_scores=None):
             })
         rows.append(row)
 
-    df = pd.DataFrame(rows).sort_values('total_reads', ascending=False)
+    df = pd.DataFrame(rows)
     out_path = prefix + '.tsv'
+    if not df.empty:
+        df = df.sort_values('total_reads', ascending=False)
     df.to_csv(out_path, sep='\t', index=False)
     print(f"Wrote LTR summary to {out_path}")
 
