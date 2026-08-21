@@ -1,8 +1,8 @@
 ## WGCNA
 library(WGCNA)
 
-adj_vst <- readRDS("adj_vst.rds")
-meta <- readRDS("pca_metadata-vst.rds")
+adj_vst <- readRDS("adj_vst_0427.rds")
+meta <- readRDS("pca_metadata-vst_0427.rds")
 #### 1
 options(stringsAsFactors = FALSE)
 # Enable threading if available (Linux/macOS)
@@ -113,5 +113,5 @@ saveRDS(list(
     traits = traits,
     datExpr = datExpr,
     softpwr = softPower
-), file = "WGCNA_fullResults_021926.rds")
+), file = "WGCNA_fullResults_042726.rds")
 
