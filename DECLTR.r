@@ -198,8 +198,8 @@ for (fp in classifier_files) {
   base <- basename(fp)
   print(paste("Processing file:", base))
   # decide label
-  if (grepl("CT_[0-9]+", base, ignore.case = TRUE)) {
-    label <- sub("(?i)(CT_[0-9]+).*", "\\1", base, perl = TRUE)
+  if (grepl("CT[0-9]+", base, ignore.case = TRUE)) {
+    label <- sub("(?i)(CT[0-9]+).*", "\\1", base, perl = TRUE)
   } else if (grepl("CTMerge", base, ignore.case = TRUE)) {
     label <- "CTMerge"
   } else if (grepl("Cold", base, ignore.case = TRUE)) {
@@ -543,6 +543,14 @@ ont_ct_merge_cols_gene <- grep("^gene_Total_Reads_ONT_CTMerge", nm, value = TRUE
 ont_ct_merge_cols_ltr  <- grep("^LTR_Total_Reads_ONT_CTMerge",  nm, value = TRUE)
 ont_ct_merge_cols      <- c(ont_ct_merge_cols_gene, ont_ct_merge_cols_ltr)
 
+## ONT per-replicate columns (CT1, CT2, CT3 treated as distinct biological replicates)
+ont_ct_reps <- c("CT1", "CT2", "CT3")
+ont_ct_rep_cols <- setNames(lapply(ont_ct_reps, function(rep) {
+  c(grep(paste0("^gene_Total_Reads_ONT_", rep, "_"), nm, value = TRUE),
+    grep(paste0("^LTR_Total_Reads_ONT_",  rep, "_"), nm, value = TRUE))
+}), ont_ct_reps)
+ont_ct_rep_cols_all <- unlist(ont_ct_rep_cols, use.names = FALSE)
+
 ## ONT Cold columns (if any)
 cold_cols <- grep("Cold", nm, value = TRUE)
 
@@ -556,6 +564,7 @@ to_numeric <- unique(c(
   illumina_cols,
   pb_all_cols,
   ont_ct_merge_cols,
+  ont_ct_rep_cols_all,
   cold_cols,
   chip_cols,
   umr_col
@@ -600,19 +609,19 @@ estimate_seg_threshold <- function(counts, max_k = 20L, default = 1L) {
 }
 
 # =========================
-# 3) ONT segmented regression — UNIFIED across all loci
+# 3) ONT segmented regression — per biological replicate (CT1, CT2, CT3)
 # =========================
 
-# All ONT merged counts (genes + LTRs together)
-ont_all_counts <- if (length(ont_ct_merge_cols)) {
-  coalesce0(rowSums(decltr_res_df[, ont_ct_merge_cols, drop = FALSE], na.rm = TRUE))
-} else {
-  rep(0, nrow(decltr_res_df))
+THRESH_ONT_CT <- setNames(rep(NA_real_, length(ont_ct_reps)), ont_ct_reps)
+for (rep in ont_ct_reps) {
+  rep_cols <- ont_ct_rep_cols[[rep]]
+  if (length(rep_cols)) {
+    counts <- coalesce0(rowSums(decltr_res_df[, rep_cols, drop = FALSE], na.rm = TRUE))
+    THRESH_ONT_CT[[rep]] <- estimate_seg_threshold(counts, default = 1L)
+  } else {
+    THRESH_ONT_CT[[rep]] <- 1L
+  }
 }
-
-ONT_THRESH <- estimate_seg_threshold(ont_all_counts, default = 1L)
-
-THRESH_ONT_CT <- ONT_THRESH   # single numeric value
 
 ## TEMP
 ONT_THRESH_COLD <- 1
@@ -705,8 +714,11 @@ groups <- list(
   Pollen     = list(pb = pb_expr_cols_by_tissue("Pollen")),
   Leaf       = list(
     illumina = c(v11_base_cols, v11_middle_cols, v11_tip_cols),
-    ont      = ont_ct_merge_cols
-  )
+    ont      = ont_ct_rep_cols_all
+  ),
+  ONT_CT1    = list(ont = ont_ct_rep_cols[["CT1"]]),
+  ONT_CT2    = list(ont = ont_ct_rep_cols[["CT2"]]),
+  ONT_CT3    = list(ont = ont_ct_rep_cols[["CT3"]])
 )
 
 # ===============================================
@@ -730,35 +742,59 @@ pb_tot <- if (length(pb_expr_cols_all)) {
 } else {
   rep(0, nrow(decltr_res_df))
 }
-ont_tot <- if (length(ont_ct_merge_cols)) {
-  X <- as.matrix(decltr_res_df[, ont_ct_merge_cols, drop = FALSE])
+# Per-replicate ONT totals and pass flags
+ont_rep_tots <- lapply(ont_ct_rep_cols, function(cols) {
+  if (!length(cols)) return(rep(0, nrow(decltr_res_df)))
+  X <- as.matrix(decltr_res_df[, cols, drop = FALSE])
   storage.mode(X) <- "numeric"
   X[!is.finite(X)] <- 0
   rowSums(X)
-} else {
-  rep(0, nrow(decltr_res_df))
-}
-ill_tot_log  <- log1p(ill_tot)
-pb_tot_log   <- log1p(pb_tot)
-ont_tot_log  <- log1p(ont_tot)
+})
+ont_rep_tots_log <- lapply(ont_rep_tots, log1p)
+
+ONT_REP_SUM_THR_log <- setNames(
+  vapply(ont_ct_reps, function(rep)
+    estimate_seg_threshold(ont_rep_tots_log[[rep]], default = 1L),
+    numeric(1)),
+  ont_ct_reps
+)
+
+ill_tot_log <- log1p(ill_tot)
+pb_tot_log  <- log1p(pb_tot)
 
 # ---- UNIFIED summary thresholds (all loci together) ----
-ILL_SUM_THR_log  <- estimate_seg_threshold(ill_tot_log,  default = 1L)
-PB_SUM_THR_log   <- estimate_seg_threshold(pb_tot_log,   default = 1L)
-ONT_SUM_THR_log  <- estimate_seg_threshold(ont_tot_log,  default = 1L)
+ILL_SUM_THR_log <- estimate_seg_threshold(ill_tot_log, default = 1L)
+PB_SUM_THR_log  <- estimate_seg_threshold(pb_tot_log,  default = 1L)
 
-segmented_breakpoints <- data.frame(
-  Platform         = c("Illumina", "PacBio", "ONT"),
-  Breakpoint_log1p = c(ILL_SUM_THR_log, PB_SUM_THR_log, ONT_SUM_THR_log)
+segmented_breakpoints <- rbind(
+  data.frame(
+    Platform  = "ONT",
+    Sample    = ont_ct_reps,
+    Breakpoint_log1p = unname(THRESH_ONT_CT)
+  ),
+  data.frame(
+    Platform  = "PacBio",
+    Sample    = names(THRESH_PB),
+    Breakpoint_log1p = unname(THRESH_PB)
+  ),
+  data.frame(
+    Platform  = "Illumina",
+    Sample    = names(ILL_THRESH),
+    Breakpoint_log1p = unname(ILL_THRESH)
+  )
 )
-segmented_breakpoints$Breakpoint_raw_scale <- exp(segmented_breakpoints$Breakpoint_log1p) - 1
-segmented_breakpoints
+names(segmented_breakpoints)[names(segmented_breakpoints) == "Breakpoint_log1p"] <- "Breakpoint_raw"
+segmented_breakpoints$Breakpoint_log1p <- log1p(segmented_breakpoints$Breakpoint_raw)
 write.csv(segmented_breakpoints, "Segmented_Breakpoints.csv", row.names = FALSE)
 
 # ---- UNIFIED pass flags (same threshold for genes and LTRs) ----
 pass_ill_sum <- ill_tot_log >= ILL_SUM_THR_log
 pass_pb_sum  <- pb_tot_log  >= PB_SUM_THR_log
-pass_ont_sum <- ont_tot_log >= ONT_SUM_THR_log
+# ONT: passes if any single replicate clears its own threshold
+pass_ont_reps <- mapply(function(tot, thr) tot >= thr,
+  ont_rep_tots_log, as.list(ONT_REP_SUM_THR_log),
+  SIMPLIFY = FALSE)
+pass_ont_sum <- Reduce("|", pass_ont_reps)
 
 # Note: Classification column is retained in the data for interpretability in
 # the output, but plays no role in filtering or threshold decisions.
@@ -844,7 +880,6 @@ build_omics_matrices <- function(decltr_res_df,
                                  groups,
                                  illumina_cols,
                                  pb_expr_cols_all,
-                                 ont_ct_merge_cols,
                                  chip_cols,
                                  umr_col) {
   df <- decltr_res_df %>%
@@ -887,13 +922,19 @@ build_omics_matrices <- function(decltr_res_df,
     colnames(pb_mat) <- loci
   }
 
-  # ---- ONT (leaf only) ----
+  # ---- ONT: one row per group with $ont slot (Leaf combined + per-replicate) ----
   ont_mat <- NULL
-  if (length(ont_ct_merge_cols) > 0) {
-    tmp <- df
-    tmp[, ont_ct_merge_cols] <- lapply(tmp[, ont_ct_merge_cols, drop = FALSE], log1p_safe)
-    ont_leaf <- summarize_group_median(tmp, ont_ct_merge_cols)
-    ont_mat  <- matrix(ont_leaf, nrow = 1, dimnames = list("ONT_Leaf", loci))
+  ont_group_names <- names(groups)[vapply(groups, function(g) !is.null(g$ont), logical(1))]
+  if (length(ont_group_names)) {
+    ont_rows <- sapply(ont_group_names, function(gname) {
+      cols <- groups[[gname]]$ont
+      tmp  <- df
+      if (length(cols)) tmp[, cols] <- lapply(tmp[, cols, drop = FALSE], log1p_safe)
+      summarize_group_median(tmp, cols)
+    })
+    ont_mat <- t(ont_rows)
+    rownames(ont_mat) <- ont_group_names
+    colnames(ont_mat) <- loci
   }
 
   # ---- ChIP ----
@@ -974,13 +1015,22 @@ compute_activity_scores_log <- function(
       pb_ev <- sigmoid01_delta(delta, s = s)
     }
 
-    # --- ONT evidence (Leaf only) ---
+    # --- ONT evidence: combined Leaf row or per-replicate ONT_CT* row ---
     ont_ev <- rep(NA_real_, length(loci))
-    if (!is.null(omics_log$ONT) && "ONT_Leaf" %in% rownames(omics_log$ONT) && t %in% c("Leaf")) {
-      thr   <- group_thr_ont(THRESH_ONT_CT)
-      mid   <- log1p(thr)
-      delta <- as.numeric(omics_log$ONT["ONT_Leaf", ]) - mid
-      ont_ev <- sigmoid01_delta(delta, s = s)
+    if (!is.null(omics_log$ONT)) {
+      if (t == "Leaf" && "Leaf" %in% rownames(omics_log$ONT)) {
+        # Combined leaf ONT: threshold = median of per-replicate thresholds
+        thr   <- group_thr_ont(median(as.numeric(THRESH_ONT_CT), na.rm = TRUE))
+        mid   <- log1p(thr)
+        delta <- as.numeric(omics_log$ONT["Leaf", ]) - mid
+        ont_ev <- sigmoid01_delta(delta, s = s)
+      } else if (grepl("^ONT_CT", t) && t %in% rownames(omics_log$ONT)) {
+        rep_name <- sub("^ONT_", "", t)   # "CT1", "CT2", or "CT3"
+        thr   <- group_thr_ont(THRESH_ONT_CT[[rep_name]])
+        mid   <- log1p(thr)
+        delta <- as.numeric(omics_log$ONT[t, ]) - mid
+        ont_ev <- sigmoid01_delta(delta, s = s)
+      }
     }
 
     # --- fuse (weighted mean, NA-safe per locus) ---
@@ -1027,6 +1077,7 @@ label_loci_from_activity <- function(
   leaf_alias <- function(x) {
     x <- as.character(x)
     x[x %in% c("V11_Base", "V11_Middle", "V11_Tip")] <- "Leaf"
+    x[grepl("^ONT_CT", x)] <- "Leaf"
     x
   }
   tissues_alias <- leaf_alias(tissues_raw)
@@ -1122,13 +1173,12 @@ label_loci_from_activity <- function(
 # ------------------------------------------------------------
 
 mats <- build_omics_matrices(
-  decltr_res_df     = decltr_sub,
-  groups            = groups,
-  illumina_cols     = illumina_cols,
-  pb_expr_cols_all  = pb_expr_cols_all,
-  ont_ct_merge_cols = ont_ct_merge_cols,
-  chip_cols         = chip_cols,
-  umr_col           = umr_col
+  decltr_res_df    = decltr_sub,
+  groups           = groups,
+  illumina_cols    = illumina_cols,
+  pb_expr_cols_all = pb_expr_cols_all,
+  chip_cols        = chip_cols,
+  umr_col          = umr_col
 )
 
 butter <- compute_activity_scores_log(
@@ -1150,6 +1200,6 @@ labels <- label_loci_from_activity(
 decltr_labeled <- decltr_res_df %>%
   dplyr::left_join(labels, by = "ID")
 
-qsave(decltr_labeled, "0310_samtools-Clip_Exon_Cleave_NAM_NewScoring_GeneLTR_Unif_PycFix.qs",
+qsave(decltr_labeled, "0427_samtools-Clip_Exon_Cleave_NAM_NewScoring_GeneLTR_Unif_PycFix_ONTsep.qs",
   preset = "balanced"
 )
