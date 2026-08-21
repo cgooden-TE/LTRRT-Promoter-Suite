@@ -44,6 +44,12 @@ def parse_args():
                         help='GFF with elements, LTRs, genes, and nested features')
     parser.add_argument('--bam', nargs='+', required=True,
                         help='One or more BAM files')
+    parser.add_argument('--trust-st-tag', dest='trust_st_tag', action='store_true',
+                        help='Trust the PyChopper/AccuMap ST tag as a genomic strand call. '
+                             'OFF by default: PyChopper reorients reads, so ST records a '
+                             'transformation already applied and is ~50%% accurate (no better '
+                             'than chance). Only enable for BAMs whose ST was written by '
+                             'something that did NOT reorient reads.')
     parser.add_argument('--min_mapq', type=int, default=30,
                         help='Minimum MAPQ for filtering reads')
     parser.add_argument('--threads', type=int, default=1,
@@ -164,22 +170,64 @@ def load_elements_and_ranges(gff_path):
 
 # Get the strand for the read according to transcription direction determined by PyChopper if available.
 # Fallbacks are in descending priority.
-def infer_read_strand(read):
+def infer_read_strand(read, trust_st_tag=False):
     """
     Return '+', '-', or '.' using fallbacks:
-      1) ST tag (PyChopper)
-      2) ts tag (minimap2 transcript strand)
-      3) XS tag
-      4) jM tag (minimap2 splice motif)
-      5) alignment orientation (is_reverse)
+      1) alignment orientation (is_reverse)  -- PRIMARY, see note below
+      2) ST tag (PyChopper)  -- opt-in only, see below
+      3) ts tag (minimap2 transcript strand)
+      4) XS tag
+      5) jM tag (minimap2 splice motif)
+
+    Why alignment orientation is primary
+    -------------------------------------
+    PyChopper REVERSE-COMPLEMENTS every read it calls '-' before it ever reaches the
+    mapper, so every read classified in this pipeline is already in mRNA-sense
+    (5'->3') orientation -- the read's sequence *is* the transcript's sequence. That
+    makes the genomic strand it aligns to the strand it was transcribed from: forward
+    alignment of a sense-oriented read is a '+' transcript, reverse alignment is '-'.
+    This is what `origin`/`endpos` (and therefore every TSS/isoform call below) are
+    computed from, so it needs to be right, not just plausible.
+
+    Measured on the Dec2025 ONT libraries (CT1/CT2/CT3), scoring against intron motifs
+    and, independently, against annotated gene strand on unspliced reads:
+
+        strand = ST                    50.10%   (n ~ 600k, genome-wide)
+        strand = ST XOR is_reverse     49.41%
+        strand = alignment orientation 99.98%   (99.83% spliced / 99.44% unspliced)
+
+    ST records which way PyChopper flipped a read *before* mapping (provenance, not
+    post-mapping genomic strand) and is statistically independent of true strand.
+    `ts`/`jM` are splice-motif calls that only add independent information when
+    minimap2 is allowed to search both strands (-ub); under the old -uf mapping
+    setting they were a forced constant ('ts:A:+' on every read) that happened to
+    equal is_reverse's complement for every '-'-strand read, silently overriding it.
+    Because ST/ts sat above alignment orientation in the old cascade, and 100% of ONT
+    primary alignments carried one or the other, read strand -- and therefore every
+    ONT TSS call -- was effectively a coin flip between the read's two ends.
+
+    ST/ts/XS/jM are now fallbacks only, for the case alignment orientation is somehow
+    unavailable (it should always be available for a mapped, non-secondary,
+    non-supplementary read, which is the only kind this is called on). Set
+    trust_st_tag=True only for BAMs whose ST was written by something that did NOT
+    reorient the reads.
+
+    Ref: splice_ESE/st_tag_diagnosis/FINDINGS_ST_TAG_20260804.md
     """
-    # 1) PyChopper ST tag
-    if read.has_tag("ST"):
+    # 1) alignment orientation -- primary, see docstring above.
+    if not read.is_unmapped:
+        try:
+            return "-" if read.is_reverse else "+"
+        except Exception:
+            pass
+
+    # 2) PyChopper ST tag -- opt-in only (see docstring)
+    if trust_st_tag and read.has_tag("ST"):
         st = read.get_tag("ST")
         if st in {"+", "-"}:
             return st
 
-    # 2) minimap2 transcript strand
+    # 3) minimap2 transcript strand
     if read.has_tag("ts"):
         # For some PacBio alignments, minimap2 assumes the query is the coding strand
         # and emits ts:A:+ statically, ignoring whether it mapped forward or reverse.
@@ -191,13 +239,13 @@ def infer_read_strand(read):
             else:
                 return ts
 
-    # 3) XS tag (common in some spliced alignments)
+    # 4) XS tag (common in some spliced alignments)
     if read.has_tag("XS"):
         xs = read.get_tag("XS")
         if xs in {"+", "-"}:
             return xs
 
-    # 4) minimap2 intron motif-based inference
+    # 5) minimap2 intron motif-based inference
     # jM codes: 1=GT-AG(+), 2=CT-AC(-), 3=GC-AG(+), 4=CT-GC(-)
     if read.has_tag("jM"):
         try:
@@ -226,11 +274,7 @@ def infer_read_strand(read):
         except Exception:
             pass
 
-    # 5) fallback: alignment orientation
-    try:
-        return "-" if read.is_reverse else "+"
-    except Exception:
-        return "."
+    # 6) unknown
     return "."
 
 # (infer_element_strands removed – integrated into multiprocessing pass)
@@ -362,7 +406,8 @@ def init_worker(elem_info, gene_info, full_tree, nested_tree, gene_tree):
     _GLOBAL_NESTED_TREE = nested_tree
     _GLOBAL_GENE_TREE = gene_tree
 
-def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_paths, min_mapq):
+def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_paths, min_mapq,
+                    trust_st_tag=False):
     """Process primary reads whose alignment starts in [claim_start, claim_end) on *chrom*.
 
     Reads are fetched from [fetch_start, fetch_end) (which may extend past the claim
@@ -444,7 +489,7 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             if read.mapping_quality < min_mapq:
                 continue
 
-            strand = infer_read_strand(read)
+            strand = infer_read_strand(read, trust_st_tag=trust_st_tag)
             if strand not in ("+", "-"):
                 continue
             strand_counts[strand] += 1
@@ -637,7 +682,8 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
 def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_info,
                            gene_tree, bam_paths, min_mapq, clip_out_splice=None,
                            clip_out_nonsplice=None, ltr_exon_out=None, gene_exon_out=None,
-                           n_threads=1, chunk_size=1_000_000, overlap=10_000):
+                           n_threads=1, chunk_size=1_000_000, overlap=10_000,
+                           trust_st_tag=False):
     cats = _CATS
 
     # Discover chromosome sizes from BAM headers (union across all BAMs, max length wins
@@ -663,7 +709,7 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
             fetch_start = max(0, claim_start - overlap)
             fetch_end = min(length, claim_end + overlap)
             chunks.append((chrom, claim_start, claim_end, fetch_start, fetch_end,
-                           bam_paths, min_mapq))
+                           bam_paths, min_mapq, trust_st_tag))
             pos = claim_end
 
     print(f"Dispatching {len(chunks)} chunks ({chunk_size // 1000} kb each, "
@@ -1332,7 +1378,8 @@ def main():
         clip_out_nonsplice,
         ltr_exon_out,
         gene_exon_out,
-        n_threads=args.threads
+        n_threads=args.threads,
+        trust_st_tag=args.trust_st_tag
     )
     densities = compute_tss_density_separate(stats,
                                          tss_positions,
