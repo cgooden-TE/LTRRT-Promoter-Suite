@@ -111,33 +111,59 @@ def sort_bam(in_bam, out_bam):
 def infer_strand(read):
     """
     Determine strand for a read with the following priority:
-      1) ST tag  (PyChopper-derived tag)
-      2) minimap2 'ts' tag (transcript strand)
-      3) generic 'XS' tag (used by some aligners)
-      4) minimap2 intron motif 'jM' tag (if spliced)
-      5) alignment orientation (is_reverse)
+      1) alignment orientation (is_reverse)  -- PRIMARY, see note below
+      2) ST tag  (PyChopper-derived tag)
+      3) minimap2 'ts' tag (transcript strand)
+      4) generic 'XS' tag (used by some aligners)
+      5) minimap2 intron motif 'jM' tag (if spliced)
       6) '.' as last resort
     Returns '+', '-', or '.'
+
+    Why alignment orientation is primary
+    -------------------------------------
+    PyChopper reverse-complements every read it classifies as antisense before
+    it ever reaches the mapper, so every read handed to minimap2 is already in
+    mRNA-sense (5'->3') orientation -- the read's sequence *is* the transcript's
+    sequence. That means the genomic strand it aligns to IS the strand it was
+    transcribed from: a sense-oriented read mapping forward is a '+' strand
+    transcript, mapping reverse is a '-' strand transcript. This equivalence
+    holds because every read reaching this function has already been through
+    PyChopper's reorientation (--run_pyc); it would not hold for raw, unoriented
+    reads.
+
+    ST/ts/XS/jM are kept only as fallbacks for the rare case alignment
+    orientation is unavailable (e.g. read.is_reverse raises). They should not
+    override it: ST records which way PyChopper flipped a read *before*
+    mapping (provenance, not post-mapping genomic strand), and ts/XS/jM are
+    splice-motif calls that only become an independent signal when minimap2 is
+    allowed to search both strands (-ub, not -uf -- see run_minimap2()).
     """
-    # 1) ST (if already annotated)
+    # 1) alignment orientation -- primary, see docstring above.
+    if not read.is_unmapped:
+        try:
+            return "-" if read.is_reverse else "+"
+        except Exception:
+            pass
+
+    # 2) ST (PyChopper-derived tag; provenance, not orientation -- fallback only)
     if read.has_tag("ST"):
         st = read.get_tag("ST")
         if st in {"+", "-"}:
             return st
 
-    # 2) minimap2 transcript strand
+    # 3) minimap2 transcript strand
     if read.has_tag("ts"):
         ts = read.get_tag("ts")
         if ts in {"+", "-"}:
             return ts
 
-    # 3) XS (common in STAR/TopHat style)
+    # 4) XS (common in STAR/TopHat style)
     if read.has_tag("XS"):
         xs = read.get_tag("XS")
         if xs in {"+", "-"}:
             return xs
 
-    # 4) minimap2 intron motif-based inference
+    # 5) minimap2 intron motif-based inference
     #    jM = list of motif codes per intron. We'll use the first informative one.
     #    Map: 1=GT-AG(+), 2=CT-AC(-), 3=GC-AG(+), 4=CT-GC(-)
     if read.has_tag("jM"):
@@ -157,12 +183,6 @@ def infer_strand(read):
                         return "-"
         except Exception:
             pass
-
-    # 5) fall back to alignment orientation (not transcript-aware, but better than a blanket '+')
-    try:
-        return "-" if read.is_reverse else "+"
-    except Exception:
-        pass
 
     # 6) unknown
     return "."
@@ -200,8 +220,11 @@ def run_minimap2(ref, fq, bam_out, log, t=24, sec="no", gap=20000, preset="splic
         # PacBio IsoSeq / HiFi reads
         ax_flags = "-ax splice:hq"
     else:
-        # ONT cDNA/dRNA default
-        ax_flags = f"-ax {preset} -uf -k14"
+        # ONT cDNA/dRNA default.
+        # -ub (not -uf): let minimap2 test splice motifs on both strands. -uf forces
+        # a forward-only splice model, which makes its 'ts'/'jM' strand calls a
+        # constant '+' instead of an independent signal -- see infer_strand() below.
+        ax_flags = f"-ax {preset} -ub -k14"
 
     command = (
         f"minimap2 {ax_flags} --secondary={sec} -G {gap} -t {t} {ref} {fq}"
