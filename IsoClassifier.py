@@ -1,21 +1,67 @@
 #!/usr/bin/env python3
 """
-Classifier for LTR retrotransposon isoforms and gene read/TSS summary across multiple replicates
-with nested-element reporting using intervaltree
+Classifier for transposable-element and gene isoforms with read/TSS summaries across replicates.
 
-Inputs: 
-    - GFF with LTR elements, genes, and nested features
+This classifier is intended for use with high quality long reads (PacBio HiFi or ONT Q20+) that are
+mapped to a reference genome and can be accurately assigned a locus and an isoform category. It is
+not intended for use with short reads or low quality long reads.
+
+Feature model
+-------------
+Every annotated feature that can originate a transcript is loaded as an "element" with a class:
+
+  LTR_structural : LTR retrotransposon with a Parent attribute and both LTRs resolved
+                   (EDTA Method=structural). TSS is assigned from the LTR the read starts in,
+                   so these get the full LTR-aware isoform vocabulary.
+  LTR_fragment   : LTR retrotransposon called by homology (EDTA Method=homology). No usable LTR
+                   pair, so TSS is assigned from the read coordinate within the element body.
+  TIR, Helitron,
+  LINE, SINE     : DNA transposons and non-LTR retrotransposons. Body-coordinate TSS.
+  Gene           : protein-coding gene. Body-coordinate TSS, with full-length judged against the
+                   union of annotated exons rather than the gene span.
+
+Structural bookkeeping rows (repeat_region, target_site_duplication) and non-transposon repeats
+(knob, centromeric_repeat, subtelomere, rDNA_intergenic_spacer_element, low_complexity) are dropped.
+
+Assignment
+----------
+A read is assigned to the *innermost* feature containing its TSS: of every feature whose span
+contains the 5' end, the one with the smallest span wins. Every other containing feature is
+reported as a nesting parent, so a read starting inside a TE that sits inside a gene is credited
+to the TE and flagged as nested in the gene. Genes and TEs compete in the same index, so no
+gene-versus-TE precedence rule is needed.
+
+Orientation
+-----------
+Categories are computed in the *read's* frame: the LTR a read initiates in is its 5' LTR whether
+or not the read agrees with the element's annotated strand. A record is labelled sense when the
+read strand matches the element strand and antisense when it does not, and the two are written to
+separate isoform files. Features annotated with an unknown strand ('.' or '?') are resolved after
+classification by majority read strand.
+
+TSS agreement
+-------------
+For each feature and orientation the modal 5' end is taken as the peak, and the fraction of that
+feature's reads falling in the window centred on it is reported. A peak holding at least
+--tss-min-frac of the reads is flagged TSS_Called=1. This is reported, never used to discard reads.
+
+Inputs:
+    - GFF with TE annotations (EDTA-style) and genes
+    - Optional gene GFF3 with exon records, for exon-aware gene full-length calls
     - One or more BAM files with mapped reads
     - Minimum MAPQ for filtering reads
 
 Outputs:
-    - TSV of LTR isoforms with read counts, lengths, splicing, and junctions
-    - TSS summary for LTR isoforms
-    - TSV of gene read counts and TSS summary (total reads + top TSS positions)
+    - <prefix>_sense.isoforms.tsv / <prefix>_antisense.isoforms.tsv
+    - TSS, cleavage, and density summaries carrying an Orientation column
+    - Gene read count and TSS summary carrying an Orientation column
+    - Per-read soft-clip and exon-statistics tables
+    - Optional U3/LTR and promoter FASTAs
 
 Example Usage:
     python3 IsoClassifier.py \
-        --gff annotations.gff \
+        --gff TEs_LTRs_Genes_UpdStr.gff \
+        --gene-gff Zea_mays.Zm-B73-REFERENCE-NAM-5.0.60.gff3 \
         --bam sample1.bam sample2.bam \
         --min_mapq 30 \
         --threads 4 \
@@ -25,6 +71,7 @@ Example Usage:
 """
 import argparse
 import logging
+import re
 import time
 from collections import Counter, defaultdict
 from multiprocessing import Pool
@@ -36,14 +83,77 @@ from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
+# ---------------------------------------------------------------------------
+# Feature classes and isoform vocabularies
+# ---------------------------------------------------------------------------
+
+# Feature-type patterns mapped to element classes. Order matters: first match wins.
+# LTR retrotransposons are split into structural/fragment later, by Method and LTR availability.
+CLASS_PATTERNS = [
+    (re.compile(r'LTR_retrotransposon$'),        'LTR'),
+    (re.compile(r'_TIR_transposon$'),            'TIR'),
+    (re.compile(r'^helitron$', re.I),            'Helitron'),
+    (re.compile(r'LINE'),                        'LINE'),
+    (re.compile(r'SINE'),                        'SINE'),
+    (re.compile(r'^gene$'),                      'Gene'),
+]
+
+# Rows that describe annotation bookkeeping or non-transposon repeats. Never become elements.
+DROP_FEATURES = {
+    'repeat_region', 'target_site_duplication', 'knob', 'centromeric_repeat',
+    'subtelomere', 'rDNA_intergenic_spacer_element', 'low_complexity',
+    'chromosome', 'scaffold', 'contig',
+}
+
+# Isoform vocabulary for structural LTR-RTs, named in the read's frame.
+LTR_CATS = ['ltr5_contained', 'ltr3_contained', 'spanning',
+            'readout_5ltr', 'readout_3ltr', 'readout_internal',
+            'spliced_ltr5', 'spliced_ltr3', 'spliced_spanning', 'partial']
+
+# Isoform vocabulary for every other class, and for structural elements whose TSS falls in the
+# internal domain rather than an LTR.
+SIMPLE_CATS = ['full_length', 'spliced', 'readout', 'partial']
+
+# Union used for the wide isoform table; a feature only ever populates its own vocabulary.
+ALL_CATS = LTR_CATS + [c for c in SIMPLE_CATS if c not in LTR_CATS]
+
+# Categories whose membership test already fixes the splice counter, so emitting it would just
+# restate another column: these require a real intron, so n_spliced always equals <cat>_reads.
+SPLICED_BY_DEF = {'spliced_ltr5', 'spliced_ltr3', 'spliced_spanning', 'spliced'}
+
+# ...and these require the absence of one, so n_spliced and unique_juncts are always 0.
+UNSPLICED_BY_DEF = {'ltr5_contained', 'ltr3_contained'}
+
+# Classes eligible for the LTR-aware vocabulary.
+LTR_CLASSES = {'LTR_structural'}
+
+# Tie-break rank when two containing features have identical spans. Lower wins.
+CLASS_RANK = {'LTR_structural': 0, 'LTR_fragment': 1, 'TIR': 2, 'Helitron': 3,
+              'LINE': 4, 'SINE': 5, 'Gene': 6}
+
+DEFAULT_TE_CLASSES = 'LTR_structural,LTR_fragment,TIR,Helitron,LINE,SINE,Gene'
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Classify LTR isoforms and gene read/TSS summary. All inputs required.'
+        description='Classify TE and gene isoforms with sense/antisense read and TSS summaries.'
     )
     parser.add_argument('--gff', required=True,
-                        help='GFF with elements, LTRs, genes, and nested features')
+                        help='GFF with TE annotations (EDTA-style), LTRs, and genes')
+    parser.add_argument('--gene-gff', dest='gene_gff', default=None,
+                        help='Optional GFF3 with exon records (e.g. the Ensembl gene annotation). '
+                             'Exons are keyed to genes by gene ID, so seqid naming need not match '
+                             'the main GFF, but coordinates must be on the same assembly. Without '
+                             'it, gene full-length falls back to gene-span coverage, which almost '
+                             'never fires for spliced transcripts.')
+    parser.add_argument('--canonical-exons-only', dest='canonical_exons_only',
+                        action='store_true',
+                        help='Use only the Ensembl_canonical transcript when building each gene\'s '
+                             'exon union (default: union across all transcripts)')
     parser.add_argument('--bam', nargs='+', required=True,
                         help='One or more BAM files')
+    parser.add_argument('--te-classes', dest='te_classes', default=DEFAULT_TE_CLASSES,
+                        help=f'Comma-separated element classes to classify (default: {DEFAULT_TE_CLASSES})')
     parser.add_argument('--trust-st-tag', dest='trust_st_tag', action='store_true',
                         help='Trust the PyChopper/AccuMap ST tag as a genomic strand call. '
                              'OFF by default: PyChopper reorients reads, so ST records a '
@@ -54,10 +164,31 @@ def parse_args():
                         help='Minimum MAPQ for filtering reads')
     parser.add_argument('--threads', type=int, default=1,
                         help='Number of parallel processes for BAM classification (default: 1)')
+    parser.add_argument('--min-intron-len', dest='min_intron_len', type=int, default=69,
+                        help='Minimum CIGAR N length counted as a real intron (default: 69)')
+    parser.add_argument('--full-length-frac', dest='full_length_frac', type=float, default=0.8,
+                        help='Covered fraction of an element (or of a gene exon union) at or above '
+                             'which a contained read is called full_length (default: 0.8)')
+    parser.add_argument('--spliced-cov-frac', dest='spliced_cov_frac', type=float, default=0.5,
+                        help='Covered fraction below which a spliced read is called spliced rather '
+                             'than full_length/spanning (default: 0.5)')
+    parser.add_argument('--tss-window', dest='tss_window', type=int, default=3,
+                        help='Width in bp of the TSS agreement window, centred on the modal 5\' end '
+                             '(default: 3, i.e. peak-1..peak+1)')
+    parser.add_argument('--tss-min-frac', dest='tss_min_frac', type=float, default=0.5,
+                        help='Fraction of a feature\'s reads that must fall in the TSS window for '
+                             'TSS_Called=1 (default: 0.5). Reported only; never discards reads.')
+    parser.add_argument('--progress-every', dest='progress_every', type=int, default=1_000_000,
+                        help='Print a progress line every N reads assessed, with an ETA read from '
+                             'the BAM indexes (default: 1000000)')
+    parser.add_argument('--include-partial', dest='include_partial', action='store_true',
+                        help='Include the partial category in the isoform tables. Partial reads are '
+                             'always written to the per-read tables with Nested_In and '
+                             'Terminates_In populated, regardless of this flag.')
     parser.add_argument('--output', required=True,
-                        help='Output prefix for LTR TSV and summaries')
+                        help='Output prefix for isoform TSVs and summaries')
     parser.add_argument('--tss_out', required=True,
-                        help='Output file for LTR isoform TSS summary')
+                        help='Output file for the isoform TSS summary')
     parser.add_argument('--gene_out', required=True,
                         help='Output file for gene read counts and TSS summary')
     parser.add_argument('--genome-fasta', dest='genome_fasta', default=None,
@@ -65,108 +196,242 @@ def parse_args():
                              '(enables u3_seq_extraction after classification)')
     return parser.parse_args()
 
+
 # Helper function to parse GFF attributes into a dictionary
 def parse_attributes(attrs):
     attr_dict = {}
-    for pair in attrs.split(';'):
+    for pair in str(attrs).split(';'):
         if '=' in pair:
             key, value = pair.split('=', 1)
-            attr_dict[key] = value
+            attr_dict[key.strip()] = value.strip()
     return attr_dict
 
-# Load GFF and build data structures for elements, genes, and nested features for removal
-def load_elements_and_ranges(gff_path):
-    print("Reading GFF and parsing elements...")
-    cols = ['chrom','src','feature','start','end','score','strand','frame','attrs']
-    df = pd.read_csv(gff_path, sep='\t', comment='#', header=None, names=cols)
 
-    full_df   = df[df['feature'].str.contains('LTR_retrotransposon', na=False)]
-    ltr_df    = df[df['feature']=='long_terminal_repeat']
-    gene_df   = df[df['feature']=='gene']
-    nested_df = df.drop(full_df.index).drop(ltr_df.index).drop(gene_df.index)
+def _base_class(feature):
+    """Map a GFF feature type to a coarse element class, or None if it is not an element."""
+    if feature in DROP_FEATURES:
+        return None
+    for pat, klass in CLASS_PATTERNS:
+        if pat.search(feature):
+            return klass
+    return None
 
-    element_info = {}
-    gene_info = {}
 
-    # Parse LTR elements
-    for _, row in full_df.iterrows():
-        attrs = parse_attributes(row['attrs'])
-        eid = attrs.get('Parent')
-        if not eid:
+def _merge_intervals(ivs):
+    """Merge a list of (start, end) half-open intervals; returns sorted, non-overlapping tuples."""
+    if not ivs:
+        return ()
+    ivs = sorted(ivs)
+    merged = [list(ivs[0])]
+    for s, e in ivs[1:]:
+        if s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return tuple((s, e) for s, e in merged)
+
+
+def load_gene_exons(gene_gff, canonical_only=False):
+    """
+    Build gene_id -> (merged_exon_intervals, exonic_length) from a GFF3 carrying exon records.
+
+    Exons are keyed to genes through their transcript Parent, so only IDs need to agree with the
+    main GFF; the seqid column is ignored entirely. That matters because the Ensembl annotation
+    names contigs '1'..'10' while the combined TE/gene reference names them 'B73_chr1'..'B73_chr10'
+    on identical coordinates.
+    """
+    print(f"Reading exon annotation from {gene_gff} ...")
+    cols = ['chrom', 'src', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attrs']
+    df = pd.read_csv(gene_gff, sep='\t', comment='#', header=None, names=cols,
+                     dtype={'attrs': str}, low_memory=False)
+
+    tx2gene = {}
+    n_canon = 0
+    tx_rows = df[df['feature'].isin(['mRNA', 'transcript'])]
+    for feature, attrs in zip(tx_rows['feature'], tx_rows['attrs']):
+        a = parse_attributes(attrs)
+        tid = a.get('ID', '')
+        gid = a.get('Parent', '')
+        if not tid or not gid:
             continue
-        element_info[eid] = {
-            'chrom': row['chrom'],
-            'start': int(row['start'])-1,
-            'end': int(row['end']),
-            'name': attrs.get('Name',''),
-            'attrs': row['attrs'],
+        if canonical_only and 'Ensembl_canonical' not in str(attrs):
+            continue
+        # Strip Ensembl 'transcript:' / 'gene:' prefixes so IDs match the main GFF's bare form
+        tx2gene[tid.split(':', 1)[-1] if ':' in tid else tid] = gid.split(':', 1)[-1] if ':' in gid else gid
+        n_canon += 1
+
+    per_gene = defaultdict(list)
+    ex_rows = df[df['feature'] == 'exon']
+    for s, e, attrs in zip(ex_rows['start'], ex_rows['end'], ex_rows['attrs']):
+        a = parse_attributes(attrs)
+        tid = a.get('Parent', '')
+        if not tid:
+            continue
+        tid = tid.split(':', 1)[-1] if ':' in tid else tid
+        gid = tx2gene.get(tid)
+        if gid is None:
+            continue
+        per_gene[gid].append((int(s) - 1, int(e)))
+
+    gene_exons = {}
+    for gid, ivs in per_gene.items():
+        merged = _merge_intervals(ivs)
+        gene_exons[gid] = (merged, sum(e - s for s, e in merged))
+
+    print(f"  {len(gene_exons)} genes with exons from {n_canon} transcripts "
+          f"({'canonical only' if canonical_only else 'all transcripts'}).")
+    return gene_exons
+
+
+def load_elements_and_ranges(gff_path, te_classes, gene_gff=None, canonical_exons_only=False):
+    """
+    Load every transcribable feature as an element and index bodies in one interval tree.
+
+    Returns
+    -------
+    feat_info : dict fid -> element record
+    body_tree : dict chrom -> IntervalTree, data = (fid, class_rank)
+    """
+    print("Reading GFF and parsing elements...")
+    cols = ['chrom', 'src', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attrs']
+    df = pd.read_csv(gff_path, sep='\t', comment='#', header=None, names=cols,
+                     dtype={'attrs': str}, low_memory=False)
+    df = df.dropna(subset=['feature', 'start', 'end'])
+
+    keep = set(c.strip() for c in te_classes.split(',') if c.strip())
+
+    feat_info = {}
+    ltr_rows = []          # (parent_id, ltr_id, start0, end)
+    class_counts = Counter()
+    skipped = Counter()
+
+    for row in df.itertuples(index=False):
+        feature = str(row.feature)
+
+        # LTR sub-features are consumed into their structural parent, never elements themselves
+        if feature == 'long_terminal_repeat':
+            a = parse_attributes(row.attrs)
+            parent = a.get('Parent')
+            if parent:
+                ltr_rows.append((parent, a.get('ID', ''), int(row.start) - 1, int(row.end)))
+            continue
+
+        base = _base_class(feature)
+        if base is None:
+            skipped[feature] += 1
+            continue
+
+        a = parse_attributes(row.attrs)
+
+        if base == 'LTR':
+            method = a.get('Method', '')
+            parent = a.get('Parent')
+            if parent and method == 'structural':
+                # Structural elements are keyed on Parent so their long_terminal_repeat
+                # children (which carry the same Parent) resolve to the same record.
+                fid, klass = parent, 'LTR_structural'
+            else:
+                fid, klass = a.get('ID'), 'LTR_fragment'
+        else:
+            fid, klass = a.get('ID'), base
+
+        if not fid:
+            skipped[feature] += 1
+            continue
+
+        feat_info[fid] = {
+            'chrom': row.chrom,
+            'start': int(row.start) - 1,
+            'end': int(row.end),
+            'strand': row.strand if row.strand in ('+', '-') else '.',
+            'strand_known': row.strand in ('+', '-'),
+            'name': a.get('Name', ''),
+            'attrs': row.attrs,
+            'class': klass,
             'ltr_left': None,
             'ltr_right': None,
-            'strand': row['strand']
+            'exons': None,
+            'exon_len': 0,
         }
+        class_counts[klass] += 1
 
-    # Parse genes
-    for _, row in gene_df.iterrows():
-        attrs = parse_attributes(row['attrs'])
-        gid = attrs.get('ID')
-        if not gid:
+    # Attach LTR coordinates to their structural parents
+    n_ltr = 0
+    for parent, lid, s, e in ltr_rows:
+        rec = feat_info.get(parent)
+        if rec is None or rec['class'] != 'LTR_structural':
             continue
-        gene_info[gid] = {
-            'chrom': row['chrom'],
-            'start': int(row['start'])-1,
-            'end': int(row['end']),
-            'name': attrs.get('Name',''),
-            'attrs': row['attrs'],
-            'strand': row['strand']
-        }
+        if lid.startswith('l'):
+            rec['ltr_left'] = (s, e)
+            n_ltr += 1
+        elif lid.startswith('r'):
+            rec['ltr_right'] = (s, e)
+            n_ltr += 1
 
-    # Parse LTR coordinates
-    for _, row in ltr_df.iterrows():
-        attrs = parse_attributes(row['attrs'])
-        eid = attrs.get('Parent')
-        if eid in element_info:
-            s, e = int(row['start'])-1, int(row['end'])
-            lid = attrs.get('ID','')
-            if lid.startswith('l'):
-                element_info[eid]['ltr_left'] = (s, e)
-            elif lid.startswith('r'):
-                element_info[eid]['ltr_right'] = (s, e)
+    # A structural element missing either LTR cannot support LTR-based TSS assignment,
+    # so it is demoted to the body-coordinate vocabulary alongside homology fragments.
+    n_demoted = 0
+    for fid, rec in feat_info.items():
+        if rec['class'] == 'LTR_structural' and not (rec['ltr_left'] and rec['ltr_right']):
+            rec['class'] = 'LTR_fragment'
+            rec['ltr_left'] = rec['ltr_right'] = None
+            n_demoted += 1
+    if n_demoted:
+        class_counts['LTR_structural'] -= n_demoted
+        class_counts['LTR_fragment'] += n_demoted
 
-    print(f"Found {len(element_info)} LTR elements; "
-          f"{sum(1 for v in element_info.values() if v['ltr_left'] and v['ltr_right'])} have both LTRs.")
-    print("Indexing intervals with intervaltree...")
+    # Drop classes the user excluded
+    if keep:
+        dropped = [fid for fid, rec in feat_info.items() if rec['class'] not in keep]
+        for fid in dropped:
+            del feat_info[fid]
 
-    full_tree      = defaultdict(IntervalTree)
-    nested_tree    = defaultdict(IntervalTree)
-    gene_tree      = defaultdict(IntervalTree)
-    nested_info    = {}
+    # Exon annotation for gene full-length calls
+    if gene_gff:
+        gene_exons = load_gene_exons(gene_gff, canonical_exons_only)
+        n_hit = 0
+        n_bad = 0
+        for fid, rec in feat_info.items():
+            if rec['class'] != 'Gene':
+                continue
+            ex = gene_exons.get(fid)
+            if not ex:
+                continue
+            merged, exlen = ex
+            # Sanity check: exons must sit inside the gene span from the main GFF, otherwise the
+            # two annotations are on different assemblies and the coverage call would be garbage.
+            if merged[0][0] < rec['start'] or merged[-1][1] > rec['end']:
+                n_bad += 1
+                continue
+            rec['exons'] = merged
+            rec['exon_len'] = exlen
+            n_hit += 1
+        n_genes = class_counts.get('Gene', 0)
+        print(f"  Attached exons to {n_hit}/{n_genes} genes"
+              + (f"; {n_bad} rejected for falling outside the gene span" if n_bad else ""))
+        if n_bad > n_hit:
+            logging.warning("Most exon records fall outside their gene span -- the two "
+                            "annotations are probably on different assemblies. Gene full_length "
+                            "calls will fall back to gene-span coverage.")
 
-    # Index LTR elements
-    for eid, info in element_info.items():
-        chrom = info['chrom']
-        if info['ltr_left']:
-            full_tree[chrom][info['ltr_left'][0]:info['ltr_left'][1]] = eid
-        if info['ltr_right']:
-            full_tree[chrom][info['ltr_right'][0]:info['ltr_right'][1]] = eid
+    print("Element classes loaded: " + ", ".join(f"{k}={v}" for k, v in sorted(class_counts.items())))
+    if skipped:
+        top = ", ".join(f"{k}={v}" for k, v in skipped.most_common(6))
+        print(f"  Skipped non-element rows: {top}")
+    print(f"  {n_ltr} long_terminal_repeat records attached; "
+          f"{n_demoted} structural elements demoted to LTR_fragment for missing an LTR.")
 
-    # Index genes
-    for gid, info in gene_info.items():
-        chrom = info['chrom']
-        gene_tree[chrom][info['start']:info['end']] = gid
+    print("Indexing element bodies with intervaltree...")
+    body_tree = defaultdict(IntervalTree)
+    for fid, rec in feat_info.items():
+        if rec['end'] <= rec['start']:
+            continue
+        body_tree[rec['chrom']][rec['start']:rec['end']] = (fid, CLASS_RANK.get(rec['class'], 9))
+    print(f"Indexed {len(feat_info)} elements across {len(body_tree)} contigs.")
 
-    # Index nested features
-    for _, row in nested_df.iterrows():
-        chrom = row['chrom']
-        s, e = int(row['start'])-1, int(row['end'])
-        nid = parse_attributes(row['attrs']).get('ID','nested')
-        parents = {iv.data for iv in full_tree[chrom].overlap(s, e)}
-        if parents:
-            nested_info[nid] = {'parent': list(parents), 'chrom': chrom, 'start': s, 'end': e}
-            nested_tree[chrom][s:e] = nid
+    return feat_info, dict(body_tree)
 
-    print(f"Indexed {len(nested_info)} nested features and {len(gene_info)} genes.")
-
-    return element_info, gene_info, full_tree, nested_tree, nested_info, gene_tree
 
 # Get the strand for the read according to transcription direction determined by PyChopper if available.
 # Fallbacks are in descending priority.
@@ -277,7 +542,6 @@ def infer_read_strand(read, trust_st_tag=False):
     # 6) unknown
     return "."
 
-# (infer_element_strands removed – integrated into multiprocessing pass)
         
 # Collects soft clipping data from 3' ends
 def softclip_3prime(read):
@@ -383,91 +647,223 @@ def exon_intron_row_fields(read, min_intron_len=69, max_exons=5, length_mode="qu
 
     return ex_n, in_n, ex_total, in_total, fields, saw_real
 
-# ---------------------------------------------------------------------------
-# Per-chromosome worker for multiprocessing
-# ---------------------------------------------------------------------------
-_CATS = ['ltr_left','ltr_right','spanning','ro5','ro3',
-         'spliced_ltr_left','spliced_ltr_right']
 
-# Global variables for worker inheritance (Zero-copy on Linux via fork)
-_GLOBAL_ELEM_INFO = {}
-_GLOBAL_GENE_INFO = {}
-_GLOBAL_FULL_TREE = {}
-_GLOBAL_NESTED_TREE = {}
-_GLOBAL_GENE_TREE = {}
+# ---------------------------------------------------------------------------
+# Assignment helpers
+# ---------------------------------------------------------------------------
 
-def init_worker(elem_info, gene_info, full_tree, nested_tree, gene_tree):
-    """Initializer to populate globals for spawned workers (Windows/Mac)"""
-    global _GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, _GLOBAL_FULL_TREE
-    global _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE
-    _GLOBAL_ELEM_INFO = elem_info
-    _GLOBAL_GENE_INFO = gene_info
-    _GLOBAL_FULL_TREE = full_tree
-    _GLOBAL_NESTED_TREE = nested_tree
-    _GLOBAL_GENE_TREE = gene_tree
+def junctions_from_read(read, min_intron_len):
+    """Reference-coordinate (donor, acceptor) pairs for every real intron in a read."""
+    juncs = set()
+    if not read.cigartuples:
+        return juncs
+    pos = read.reference_start
+    for op, length in read.cigartuples:
+        if op in (0, 2, 7, 8):        # M, D, =, X consume reference
+            pos += length
+        elif op == 3:                 # N
+            if length >= min_intron_len:
+                juncs.add((pos, pos + length))
+            pos += length
+    return juncs
+
+
+def covered_bases(blocks, intervals):
+    """Aligned read bases falling inside a sorted set of half-open reference intervals."""
+    total = 0
+    for b1, b2 in blocks:
+        for s, e in intervals:
+            if e <= b1:
+                continue
+            if s >= b2:
+                break
+            total += min(b2, e) - max(b1, s)
+    return total
+
+
+def innermost_at(tree_chrom, pos):
+    """
+    Resolve the feature a position belongs to: of every feature whose span contains pos, the one
+    with the smallest span wins, breaking ties by class rank then feature ID.
+
+    Returns (winner_fid, [other containing fids]). This single rule implements both the nested-TE
+    assignment and gene-versus-TE precedence: a read starting inside a TE that sits inside a gene
+    goes to the TE, with the gene reported as a nesting parent.
+    """
+    if tree_chrom is None:
+        return None, []
+    hits = tree_chrom.at(pos)
+    if not hits:
+        return None, []
+    best = None
+    best_key = None
+    for iv in hits:
+        fid, rank = iv.data
+        key = (iv.end - iv.begin, rank, fid)
+        if best_key is None or key < best_key:
+            best_key, best = key, fid
+    others = [iv.data[0] for iv in hits if iv.data[0] != best]
+    return best, others
+
+
+def classify_ltr(rec, origin, endpos, strand, blocks, has_intron, spliced_cov_frac):
+    """
+    Isoform category for a structural LTR-RT, computed in the read's frame.
+
+    The LTR the read initiates in is its 5' LTR regardless of the element's annotated strand, so
+    an antisense read on a '+' element is evaluated against the element's right LTR. That is the
+    whole of the sense/antisense inversion; nothing else needs a second code path.
+
+    A consequence worth stating, because it is the only way one of these categories arises: a read
+    that starts in the element's annotated 3' LTR and ends in its annotated 5' LTR is not a
+    backwards transcript, it is an antisense one. In its own frame it started in its 5' LTR and
+    ended in its 3' LTR, so it is scored as spanning and lands in the antisense table. The
+    genomically-backwards case cannot occur for a sense read and is not represented.
+
+    The three spliced categories are kept distinct because they are different transcripts:
+      spliced_ltr5 / spliced_ltr3 : contained within the LTR the read initiated in, carrying a
+        real intron. This is the dominant observed phenotype, so containment alone is not enough
+        to call a read ltr5_contained -- that category means contained *and* unspliced.
+      spliced_spanning : spans both LTRs but skipped most of the internal domain (coverage below
+        spliced_cov_frac). Formerly folded into spliced_ltr5, which made the pair asymmetric --
+        a spanning read always initiates in its 5' LTR, so the demotion could never yield
+        spliced_ltr3 and the contained phenotype could not be counted on its own.
+    """
+    ltr_l, ltr_r = rec['ltr_left'], rec['ltr_right']
+    ltr5, ltr3 = (ltr_l, ltr_r) if strand == '+' else (ltr_r, ltr_l)
+
+    in5 = ltr5[0] <= origin < ltr5[1]
+    in3 = ltr3[0] <= origin < ltr3[1]
+    past3 = endpos >= ltr3[1] if strand == '+' else endpos < ltr3[0]
+
+    if in5:
+        if ltr5[0] <= endpos < ltr5[1]:
+            # Started and finished inside the LTR it initiated in. A real intron makes this a
+            # spliced isoform rather than a plain LTR-contained read.
+            return 'spliced_ltr5' if has_intron else 'ltr5_contained'
+        if ltr3[0] <= endpos < ltr3[1]:
+            cat = 'spanning'
+        elif past3:
+            return 'readout_5ltr'
+        else:
+            return 'partial'
+    elif in3:
+        if ltr3[0] <= endpos < ltr3[1]:
+            return 'spliced_ltr3' if has_intron else 'ltr3_contained'
+        if past3:
+            return 'readout_3ltr'
+        return 'partial'
+    else:
+        # TSS sits in the internal domain, so this is not an LTR-driven transcript. It gets its
+        # own read-out category rather than the body vocabulary's plain 'readout', which would
+        # have put three different meanings of "ran past the 3' end" in one class's columns.
+        return 'readout_internal' if past3 else 'partial'
+
+    # A spanning read that skipped most of the internal domain is a spliced isoform, not coding.
+    # It keeps its own category rather than being folded in with the LTR-contained spliced reads.
+    coding_start, coding_end = ltr_l[1], ltr_r[0]
+    coding_len = coding_end - coding_start
+    if coding_len > 0 and has_intron:
+        if covered_bases(blocks, ((coding_start, coding_end),)) / coding_len < spliced_cov_frac:
+            return 'spliced_spanning'
+    return cat
+
+
+def classify_simple(rec, origin, endpos, strand, blocks, has_intron,
+                    full_length_frac, spliced_cov_frac):
+    """
+    Isoform category from body coordinates, for fragments, DNA TEs, LINEs/SINEs, and genes.
+
+    For genes with exon annotation the covered fraction is measured against the union of annotated
+    exons rather than the gene span. Measuring against the span would put essentially every spliced
+    transcript below the full-length threshold, since introns contribute nothing to the alignment.
+    """
+    b0, b1 = rec['start'], rec['end']
+    past_end = endpos >= b1 if strand == '+' else endpos < b0
+    if past_end:
+        return 'readout'
+
+    if rec['exons']:
+        intervals, denom = rec['exons'], rec['exon_len']
+    else:
+        intervals, denom = ((b0, b1),), b1 - b0
+    if denom <= 0:
+        return 'partial'
+
+    frac = covered_bases(blocks, intervals) / denom
+    if frac >= full_length_frac:
+        return 'full_length'
+    if has_intron and frac < spliced_cov_frac:
+        return 'spliced'
+    return 'partial'
+
+
+# ---------------------------------------------------------------------------
+# Per-chunk worker for multiprocessing
+# ---------------------------------------------------------------------------
+
+# Globals for worker inheritance (zero-copy on Linux via fork)
+_GLOBAL_FEAT_INFO = {}
+_GLOBAL_BODY_TREE = {}
+
+
+def init_worker(feat_info, body_tree):
+    """Initializer to populate globals for spawned workers (Windows/Mac)."""
+    global _GLOBAL_FEAT_INFO, _GLOBAL_BODY_TREE
+    _GLOBAL_FEAT_INFO = feat_info
+    _GLOBAL_BODY_TREE = body_tree
+
+
+def _empty_result(chrom):
+    return {'chrom': chrom, 'n_reads': 0, 'n_assigned': 0,
+            'strand_counts': Counter(), 'stats': {},
+            'tss_positions': {}, 'end_positions': {},
+            'clip_rows_splice': [], 'clip_rows_nonsplice': [],
+            'elem_exon_rows': [], 'gene_exon_rows': []}
+
 
 def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_paths, min_mapq,
-                    trust_st_tag=False):
+                    trust_st_tag, min_intron_len, full_length_frac, spliced_cov_frac):
     """Process primary reads whose alignment starts in [claim_start, claim_end) on *chrom*.
 
-    Reads are fetched from [fetch_start, fetch_end) (which may extend past the claim
-    bounds by the overlap margin so reads straddling a chunk boundary are still seen),
-    but only reads with reference_start inside [claim_start, claim_end) are counted —
-    that is the deduplication rule across adjacent chunks.
+    Reads are fetched from [fetch_start, fetch_end) (which may extend past the claim bounds by the
+    overlap margin so reads straddling a chunk boundary are still seen), but only reads with
+    reference_start inside [claim_start, claim_end) are counted -- that is the deduplication rule
+    across adjacent chunks. Annotation lookups use the whole-chromosome tree, so a read is never
+    truncated by chunk boundaries.
     """
+    feat_info = _GLOBAL_FEAT_INFO
+    body_tree_chrom = _GLOBAL_BODY_TREE.get(chrom, None)
 
-    # Access the massive data structures directly from global memory (zero pickling overhead)
-    elem_info = _GLOBAL_ELEM_INFO
-    gene_info = _GLOBAL_GENE_INFO
-    full_tree_chrom = _GLOBAL_FULL_TREE.get(chrom, None)
-    nested_tree_chrom = _GLOBAL_NESTED_TREE.get(chrom, None)
-    gene_tree_chrom = _GLOBAL_GENE_TREE.get(chrom, None)
+    if not body_tree_chrom:
+        return _empty_result(chrom)
 
-    # Fast path: if this chromosome has strictly zero trees in the GFF, skip entirely.
-    if not full_tree_chrom and not nested_tree_chrom and not gene_tree_chrom:
-        return {
-            'chrom': chrom, 'strand_counts': Counter(), 'stats': {},
-            'gene_stats': {}, 'gene_tss': {}, 'tss_positions': {}, 'end_positions': {},
-            'clip_rows_splice': [], 'clip_rows_nonsplice': [],
-            'ltr_exon_rows': [], 'gene_exon_rows': [], 'infer_votes': {}
-        }
-        
-    t0 = time.time()
     n_reads = 0
+    n_assigned = 0
     strand_counts = Counter()
 
-    # local accumulators -----------------------------------------------
-    stats = {}            # eid -> per-element stats
-    gene_stats = {}       # gid -> {'total': int}
-    gene_tss = {}         # gid -> [int, ...]
-    tss_positions = {}    # eid -> {cat: [int, ...]}
-    end_positions = {}    # eid -> {cat: [int, ...]}
+    stats = {}            # (fid, orient) -> per-feature stats
+    tss_positions = {}    # (fid, orient) -> {cat: [int, ...]}
+    end_positions = {}    # (fid, orient) -> {cat: [int, ...]}
 
     clip_rows_splice = []
     clip_rows_nonsplice = []
-    ltr_exon_rows = []
+    elem_exon_rows = []
     gene_exon_rows = []
-    infer_votes = {}
 
-    def _ensure_eid(eid):
-        if eid not in stats:
-            stats[eid] = {'total': 0,
-                          'counts': {c: 0 for c in _CATS},
-                          'lengths': {c: 0 for c in _CATS},
-                          'spliced': {c: 0 for c in _CATS},
-                          'junctions': {c: set() for c in _CATS},
-                          'strands': {c: [] for c in _CATS}}
-            tss_positions[eid] = {c: [] for c in _CATS}
-            end_positions[eid] = {c: [] for c in _CATS}
-
-    def _ensure_gid(gid):
-        if gid not in gene_stats:
-            gene_stats[gid] = {'total': 0}
-            gene_tss[gid] = []
+    def _ensure(key):
+        if key not in stats:
+            stats[key] = {'total': 0,
+                          'counts': {c: 0 for c in ALL_CATS},
+                          'lengths': {c: 0 for c in ALL_CATS},
+                          'spliced': {c: 0 for c in ALL_CATS},
+                          'junctions': {c: set() for c in ALL_CATS},
+                          'strands': {c: [] for c in ALL_CATS}}
+            tss_positions[key] = {c: [] for c in ALL_CATS}
+            end_positions[key] = {c: [] for c in ALL_CATS}
 
     for path in bam_paths:
         bf = pysam.AlignmentFile(path, 'rb')
-        # Iterate reads overlapping this chunk's fetch window (includes overlap margin)
         try:
             read_iter = bf.fetch(contig=chrom, start=fetch_start, end=fetch_end)
         except ValueError:
@@ -475,11 +871,8 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             continue
 
         for read in read_iter:
-            # Claim rule: only count reads whose alignment starts within this chunk's
-            # claim bounds. Reads in the overlap margin are seen here but claimed by
-            # the neighbouring chunk, so they are skipped.
             rs = read.reference_start
-            if rs < claim_start or rs >= claim_end:
+            if rs is None or rs < claim_start or rs >= claim_end:
                 continue
 
             n_reads += 1
@@ -497,197 +890,188 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             origin = read.reference_start if strand == '+' else read.reference_end - 1
             endpos = read.reference_end - 1 if strand == '+' else read.reference_start
 
-            if nested_tree_chrom and nested_tree_chrom.at(origin):
+            # Innermost containing feature wins; the rest become nesting parents.
+            winner, others = innermost_at(body_tree_chrom, origin)
+            if winner is None:
+                continue
+            rec = feat_info.get(winner)
+            if rec is None:
                 continue
 
-            L = read.reference_start
-            R = read.reference_end  # half-open
-            gene_hits = gene_tree_chrom.overlap(L, R) if gene_tree_chrom else set()
-            if gene_hits:
-                MIN_INTRON_LEN = 69
-                ex_n, in_n, ex_total, in_total, exin_fields, saw_real = exon_intron_row_fields(
-                    read,
-                    min_intron_len=MIN_INTRON_LEN,
-                    max_exons=5,
-                    length_mode="query"
-                )
-                if saw_real:
-                    for iv in gene_hits:
-                        gid = iv.data
-                        gstrand = gene_info[gid]['strand']
-                        if strand != gstrand:
-                            continue
-                        _ensure_gid(gid)
-                        gene_stats[gid]['total'] += 1
-                        gene_tss[gid].append(origin)
-                        gene_exon_rows.append((
-                            gid, chrom, origin,
-                            read.query_name, read.mapping_quality,
-                            int(read.is_reverse),
-                            ex_n, in_n, ex_total, in_total,
-                            *exin_fields
-                        ))
-                else:
-                    for iv in gene_hits:
-                        gid = iv.data
-                        gstrand = gene_info[gid]['strand']
-                        if strand != gstrand:
-                            continue
-                        _ensure_gid(gid)
-                        gene_stats[gid]['total'] += 1
-                        gene_tss[gid].append(origin)
+            klass = rec['class']
+
+            # Orientation. Features with a known strand are labelled directly. Features annotated
+            # '.' or '?' are bucketed by read strand and resolved to sense/antisense after the
+            # run, by majority read support -- the old code voted on strand but applied the result
+            # only after classification had already finished, so the vote never took effect.
+            if rec['strand_known']:
+                orient = 'sense' if strand == rec['strand'] else 'antisense'
+            else:
+                orient = 'rs+' if strand == '+' else 'rs-'
+
+            blocks = read.get_blocks()
+            juncs = junctions_from_read(read, min_intron_len)
+            has_intron = bool(juncs)
+
+            if klass == 'LTR_structural':
+                cat = classify_ltr(rec, origin, endpos, strand, blocks, has_intron,
+                                   spliced_cov_frac)
+            else:
+                cat = classify_simple(rec, origin, endpos, strand, blocks, has_intron,
+                                      full_length_frac, spliced_cov_frac)
+            if not cat:
                 continue
 
-            # compute once per read (cheap)
+            # Feature the 3' end lands in, when it differs from the assigned feature. Lets a
+            # transcript that starts in a gene and terminates inside a nested TE (or starts in a
+            # TE and runs out through a gene) be picked out for chimerism follow-up.
+            term_fid, _ = innermost_at(body_tree_chrom, endpos)
+            terminates_in = term_fid if (term_fid and term_fid != winner) else ''
+
+            key = (winner, orient)
+            _ensure(key)
+            srec = stats[key]
+            srec['total'] += 1
+            srec['counts'][cat] += 1
+            srec['lengths'][cat] += (read.query_length or read.infer_query_length() or 0)
+            srec['strands'][cat].append(strand)
+            srec['junctions'][cat] |= juncs
+            tss_positions[key][cat].append(origin)
+            end_positions[key][cat].append(endpos)
+            if has_intron:
+                srec['spliced'][cat] += 1
+            n_assigned += 1
+
+            nested_in = ";".join(others) if others else ""
             clip3S = softclip_3prime(read)
 
-            overlap_eids = {iv.data for iv in full_tree_chrom.at(origin)} if full_tree_chrom else set()
-            for eid in overlap_eids:
-                element = elem_info[eid]
-                elem_strand = element.get('strand', '.')
+            n_ex, n_in, ex_total, in_total, fields, saw_real = exon_intron_row_fields(
+                read, min_intron_len=min_intron_len, max_exons=5, length_mode="query")
 
-                # Accumulate missing strand votes
-                if elem_strand not in ('+', '-'):
-                    if eid not in infer_votes:
-                        infer_votes[eid] = {'+': 0, '-': 0}
-                    infer_votes[eid][strand] += 1
-                    
-                ltr5 = element['ltr_left'] if elem_strand == '+' else element['ltr_right']
-                ltr3 = element['ltr_right'] if elem_strand == '+' else element['ltr_left']
-                if not ltr5 or not ltr3:
-                    continue
-
-                cat = None
-                same_strand = (strand == elem_strand)
-
-                # Starts in the 5′ LTR
-                if ltr5[0] <= origin < ltr5[1] and same_strand:
-                    if ltr5[0] <= endpos < ltr5[1]:
-                        cat = 'ltr_left' if elem_strand == '+' else 'ltr_right'
-                    elif ltr3[0] <= endpos < ltr3[1]:
-                        cat = 'spanning'
-                    elif ((elem_strand == '+' and endpos >= ltr3[1]) or
-                          (elem_strand == '-' and endpos <  ltr3[0])):
-                        cat = 'ro5'
-
-                # Starts in the 3′ LTR
-                elif ltr3[0] <= origin < ltr3[1] and same_strand:
-                    if ltr3[0] <= endpos < ltr3[1]:
-                        cat = 'ltr_right' if elem_strand == '+' else 'ltr_left'
-                    elif ((elem_strand == '+' and endpos >= ltr3[1]) or
-                          (elem_strand == '-' and endpos <  ltr3[0])):
-                        cat = 'ro3'
-                    elif ltr5[0] <= endpos < ltr5[1]:
-                        cat = 'spanning'
-
-                MIN_INTRON_LEN = 69
-                has_real_intron = False
-                if read.cigartuples:
-                    for op, length in read.cigartuples:
-                        if op == 3 and length >= MIN_INTRON_LEN:
-                            has_real_intron = True
-                            break
-
-                if cat == 'spanning':
-                    coding_start = element['ltr_left'][1]
-                    coding_end   = element['ltr_right'][0]
-                    coding_len   = coding_end - coding_start
-                    if coding_len > 0:
-                        covered = sum(
-                            max(0, min(b2, coding_end) - max(b1, coding_start))
-                            for b1, b2 in read.get_blocks()
-                        )
-                        if covered / coding_len < 0.5 and has_real_intron:
-                            if ltr5[0] <= origin < ltr5[1]:
-                                cat = 'spliced_ltr_left' if elem_strand == '+' else 'spliced_ltr_right'
-                            elif ltr3[0] <= origin < ltr3[1]:
-                                cat = 'spliced_ltr_right' if elem_strand == '+' else 'spliced_ltr_left'
-                            else:
-                                cat = None
-
-                if not cat:
-                    continue
-
-                _ensure_eid(eid)
-                rec = stats[eid]
-                rec['total'] += 1
-                rec['counts'][cat] += 1
-                rec['lengths'][cat] += read.query_length
-                rec['strands'][cat].append(strand)
-                tss_positions[eid][cat].append(origin)
-                end_positions[eid][cat].append(endpos)
-                if has_real_intron:
-                    rec['spliced'][cat] += 1
-
-                stayed_in_ltr5 = (ltr5[0] <= origin < ltr5[1]) and (ltr5[0] <= endpos < ltr5[1])
-                stayed_in_ltr3 = (ltr3[0] <= origin < ltr3[1]) and (ltr3[0] <= endpos < ltr3[1])
-
-                n_exons, n_introns, ex_total, in_total, fields, saw_real = exon_intron_row_fields(
-                    read,
-                    min_intron_len=MIN_INTRON_LEN,
-                    max_exons=5,
-                    length_mode="query"
-                )
-
-                if saw_real:
-                    if stayed_in_ltr5 or stayed_in_ltr3:
-                        ltr_exon_rows.append((
-                            eid, chrom, origin, cat, read.query_name, read.mapping_quality,
-                            int(read.is_reverse),
-                            n_exons, n_introns, ex_total, in_total,
-                            *fields
-                        ))
-                    clip_rows_splice.append((
-                        eid, chrom, origin,
-                        "ltr5c_spliced" if stayed_in_ltr5 else "ltr3c_spliced" if stayed_in_ltr3 else cat,
-                        cat,
-                        read.query_name, read.mapping_quality,
-                        int(read.is_reverse),
-                        clip3S, read.reference_start, read.reference_end
-                    ))
+            row = (winner, klass, orient, chrom, origin, cat,
+                   read.query_name, read.mapping_quality, int(read.is_reverse),
+                   clip3S, read.reference_start, read.reference_end,
+                   nested_in, terminates_in)
+            if saw_real:
+                clip_rows_splice.append(row)
+                exon_row = (winner, klass, orient, chrom, origin, cat,
+                            read.query_name, read.mapping_quality, int(read.is_reverse),
+                            n_ex, n_in, ex_total, in_total, *fields,
+                            nested_in, terminates_in)
+                if klass == 'Gene':
+                    gene_exon_rows.append(exon_row)
                 else:
-                    clip_rows_nonsplice.append((
-                        eid, chrom, origin,
-                        "ltr5c_nonspliced" if stayed_in_ltr5 else "ltr3c_nonspliced" if stayed_in_ltr3 else cat,
-                        cat,
-                        read.query_name, read.mapping_quality,
-                        int(read.is_reverse),
-                        clip3S, read.reference_start, read.reference_end
-                    ))
+                    elem_exon_rows.append(exon_row)
+            else:
+                clip_rows_nonsplice.append(row)
 
         bf.close()
 
-    elapsed = time.time() - t0
-    print(f"  {chrom}:{claim_start}-{claim_end}: {n_reads} reads processed in {elapsed:.1f}s")
-
     return {
         'chrom': chrom,
+        'n_reads': n_reads,
+        'n_assigned': n_assigned,
         'strand_counts': strand_counts,
         'stats': stats,
-        'gene_stats': gene_stats,
-        'gene_tss': gene_tss,
         'tss_positions': tss_positions,
         'end_positions': end_positions,
         'clip_rows_splice': clip_rows_splice,
         'clip_rows_nonsplice': clip_rows_nonsplice,
-        'ltr_exon_rows': ltr_exon_rows,
+        'elem_exon_rows': elem_exon_rows,
         'gene_exon_rows': gene_exon_rows,
-        'infer_votes': infer_votes,
     }
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher: shards by chromosome, merges results, writes output files
+# Dispatcher: shards by chunk, merges results, writes per-read files
 # ---------------------------------------------------------------------------
-def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_info,
-                           gene_tree, bam_paths, min_mapq, clip_out_splice=None,
-                           clip_out_nonsplice=None, ltr_exon_out=None, gene_exon_out=None,
-                           n_threads=1, chunk_size=1_000_000, overlap=10_000,
-                           trust_st_tag=False):
-    cats = _CATS
 
-    # Discover chromosome sizes from BAM headers (union across all BAMs, max length wins
-    # if a contig appears with different lengths).
+def _classify_chunk_star(a):
+    """imap_unordered passes a single argument, so unpack the chunk tuple here."""
+    return _classify_chunk(*a)
+
+
+def _fmt_hms(seconds):
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _expected_read_total(bam_paths, contigs):
+    """
+    Mapped reads on the contigs that will actually be scanned, read from the BAM indexes.
+
+    Used only to turn elapsed time into an ETA. Returns 0 if any index is unusable, in which case
+    progress is reported without a projection rather than with a wrong one.
+    """
+    total = 0
+    for path in bam_paths:
+        try:
+            bf = pysam.AlignmentFile(path, 'rb')
+            try:
+                for st in bf.get_index_statistics():
+                    if st.contig in contigs:
+                        total += st.mapped
+            finally:
+                bf.close()
+        except Exception:
+            return 0
+    return total
+
+
+def _new_stat_rec():
+    return {'total': 0,
+            'counts': {c: 0 for c in ALL_CATS},
+            'lengths': {c: 0 for c in ALL_CATS},
+            'spliced': {c: 0 for c in ALL_CATS},
+            'junctions': {c: set() for c in ALL_CATS},
+            'strands': {c: [] for c in ALL_CATS}}
+
+
+def compute_tss_peak(origins, window, min_frac):
+    """
+    Modal 5' end for a feature, and how much of its read support sits on that peak.
+
+    The window is centred on the peak, so the default width of 3 covers peak-1..peak+1. Reported
+    only -- TSS_Called never gates which reads are counted.
+    """
+    if not origins:
+        return ('NA', 0, 0.0, 0)
+    ctr = Counter(origins)
+    total = len(origins)
+    peak, _ = ctr.most_common(1)[0]
+    half = max(0, (window - 1) // 2)
+    cnt = sum(v for pos, v in ctr.items() if abs(pos - peak) <= half)
+    frac = cnt / total
+    return (peak, cnt, frac, int(frac >= min_frac))
+
+
+def nesting_parents(fid, feat_info, body_tree):
+    """Features whose span strictly contains this one, using the same rank tiebreak as assignment."""
+    rec = feat_info[fid]
+    tree = body_tree.get(rec['chrom'])
+    if tree is None:
+        return []
+    span = rec['end'] - rec['start']
+    rank = CLASS_RANK.get(rec['class'], 9)
+    out = []
+    for iv in tree.overlap(rec['start'], rec['end']):
+        other, orank = iv.data
+        if other == fid:
+            continue
+        if iv.begin <= rec['start'] and iv.end >= rec['end']:
+            ospan = iv.end - iv.begin
+            if ospan > span or (ospan == span and orank < rank):
+                out.append(other)
+    return sorted(out)
+
+
+def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
+                           clip_out_splice=None, clip_out_nonsplice=None,
+                           elem_exon_out=None, gene_exon_out=None,
+                           n_threads=1, chunk_size=1_000_000, overlap=10_000):
+    # Discover chromosome sizes from BAM headers (union across all BAMs, max length wins).
     chrom_sizes = {}
     for p in bam_paths:
         bf = pysam.AlignmentFile(p, 'rb')
@@ -695,21 +1079,19 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
             chrom_sizes[ref] = max(chrom_sizes.get(ref, 0), length)
         bf.close()
 
-    # Shard each chromosome into fixed-size chunks with an overlap margin on the fetch
-    # range. Claim bounds are non-overlapping so no read is double-counted.
     chunks = []
     for chrom in sorted(chrom_sizes):
         length = chrom_sizes[chrom]
-        if length <= 0:
+        if length <= 0 or chrom not in body_tree:
             continue
         pos = 0
         while pos < length:
             claim_start = pos
             claim_end = min(pos + chunk_size, length)
-            fetch_start = max(0, claim_start - overlap)
-            fetch_end = min(length, claim_end + overlap)
-            chunks.append((chrom, claim_start, claim_end, fetch_start, fetch_end,
-                           bam_paths, min_mapq, trust_st_tag))
+            chunks.append((chrom, claim_start, claim_end,
+                           max(0, claim_start - overlap), min(length, claim_end + overlap),
+                           bam_paths, min_mapq, args.trust_st_tag, args.min_intron_len,
+                           args.full_length_frac, args.spliced_cov_frac))
             pos = claim_end
 
     print(f"Dispatching {len(chunks)} chunks ({chunk_size // 1000} kb each, "
@@ -717,616 +1099,374 @@ def classify_multiple_bams(elem_info, gene_info, full_tree, nested_tree, nested_
 
     start_time = time.time()
 
-    # Pre-populate globals for the main process so `fork()` naturally shares them to workers.
-    # Note: On Linux, `initargs` isn't strictly necessary since it defaults to fork,
-    # but providing it guarantees strict compatibility for Windows/Mac (spawn methods).
-    global _GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO, _GLOBAL_FULL_TREE
-    global _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE
-    _GLOBAL_ELEM_INFO = elem_info
-    _GLOBAL_GENE_INFO = gene_info
-    _GLOBAL_FULL_TREE = full_tree
-    _GLOBAL_NESTED_TREE = nested_tree
-    _GLOBAL_GENE_TREE = gene_tree
+    global _GLOBAL_FEAT_INFO, _GLOBAL_BODY_TREE
+    _GLOBAL_FEAT_INFO = feat_info
+    _GLOBAL_BODY_TREE = body_tree
+
+    # Progress is reported on reads assessed, aggregated across workers, rather than one line per
+    # chunk -- 1 Mb chunks meant thousands of lines per run.
+    step = max(1, args.progress_every)
+    expected = _expected_read_total(bam_paths, {c[0] for c in chunks})
+    results = []
+    seen = 0
+    assigned = 0
+    next_mark = step
+
+    def _tick(res):
+        nonlocal seen, assigned, next_mark
+        results.append(res)
+        seen += res['n_reads']
+        assigned += res['n_assigned']
+        if seen < next_mark:
+            return
+        elapsed = time.time() - start_time
+        msg = f"  {seen:,} reads assessed, {assigned:,} assigned | {_fmt_hms(elapsed)} elapsed"
+        if expected and seen < expected and elapsed > 0:
+            msg += (f" | {100.0 * seen / expected:.1f}% of {expected:,}"
+                    f" | ETA {_fmt_hms(elapsed * (expected - seen) / seen)}")
+        print(msg, flush=True)
+        next_mark = (seen // step + 1) * step
 
     if n_threads > 1:
-        with Pool(processes=n_threads,
-                  initializer=init_worker,
-                  initargs=(_GLOBAL_ELEM_INFO, _GLOBAL_GENE_INFO,
-                            _GLOBAL_FULL_TREE, _GLOBAL_NESTED_TREE, _GLOBAL_GENE_TREE)) as pool:
-            # chunksize=1 so each worker grabs the next chunk as it finishes,
-            # which balances load when chunks vary in read density.
-            results = pool.starmap(_classify_chunk, chunks, chunksize=1)
+        with Pool(processes=n_threads, initializer=init_worker,
+                  initargs=(feat_info, body_tree)) as pool:
+            for res in pool.imap_unordered(_classify_chunk_star, chunks, chunksize=1):
+                _tick(res)
     else:
-        results = [_classify_chunk(*a) for a in chunks]
+        for a in chunks:
+            _tick(_classify_chunk(*a))
 
-    # Merge per-chromosome results -----------------------------------------
+    # Merge. Accumulators are sparse -- only features that actually received reads get a record.
+    # Pre-allocating every feature was affordable at 52k structural elements but is not at the
+    # ~1.1M features the full TE annotation brings in.
     strand_counts = Counter()
-    stats = {eid: {'total': 0,
-                   'counts': {c: 0 for c in cats},
-                   'lengths': {c: 0 for c in cats},
-                   'spliced': {c: 0 for c in cats},
-                   'junctions': {c: set() for c in cats},
-                   'strands': {c: [] for c in cats}}
-             for eid in elem_info}
-    gene_stats = {gid: {'total': 0} for gid in gene_info}
-    gene_tss = {gid: [] for gid in gene_info}
-    tss_positions = {eid: {c: [] for c in cats} for eid in elem_info}
-    end_positions = {eid: {c: [] for c in cats} for eid in elem_info}
+    stats = {}
+    tss_positions = {}
+    end_positions = {}
     clip_rows_splice = []
     clip_rows_nonsplice = []
-    ltr_exon_rows = []
+    elem_exon_rows = []
     gene_exon_rows = []
-    global_infer_votes = {}
 
     for res in results:
         strand_counts += res['strand_counts']
 
-        for eid, r in res['stats'].items():
-            s = stats[eid]
+        for key, r in res['stats'].items():
+            s = stats.get(key)
+            if s is None:
+                s = stats[key] = _new_stat_rec()
+                tss_positions[key] = {c: [] for c in ALL_CATS}
+                end_positions[key] = {c: [] for c in ALL_CATS}
             s['total'] += r['total']
-            for c in cats:
-                s['counts'][c] += r['counts'][c]
-                s['lengths'][c] += r['lengths'][c]
-                s['spliced'][c] += r['spliced'][c]
-                s['junctions'][c] |= r['junctions'][c]
-                s['strands'][c].extend(r['strands'][c])
+            for c in ALL_CATS:
+                if r['counts'][c]:
+                    s['counts'][c] += r['counts'][c]
+                    s['lengths'][c] += r['lengths'][c]
+                    s['spliced'][c] += r['spliced'][c]
+                    s['strands'][c].extend(r['strands'][c])
+                if r['junctions'][c]:
+                    s['junctions'][c] |= r['junctions'][c]
 
-        for gid, r in res['gene_stats'].items():
-            if gid not in gene_stats:
-                gene_stats[gid] = {'total': 0}
-                gene_tss[gid] = []
-            gene_stats[gid]['total'] += r['total']
-
-        for gid, positions in res['gene_tss'].items():
-            if gid not in gene_tss:
-                gene_tss[gid] = []
-            gene_tss[gid].extend(positions)
-
-        for eid, pos_dict in res['tss_positions'].items():
-            for c in cats:
-                tss_positions[eid][c].extend(pos_dict[c])
-
-        for eid, pos_dict in res['end_positions'].items():
-            for c in cats:
-                end_positions[eid][c].extend(pos_dict[c])
+        for key, pos_dict in res['tss_positions'].items():
+            dst = tss_positions[key]
+            for c, lst in pos_dict.items():
+                if lst:
+                    dst[c].extend(lst)
+        for key, pos_dict in res['end_positions'].items():
+            dst = end_positions[key]
+            for c, lst in pos_dict.items():
+                if lst:
+                    dst[c].extend(lst)
 
         clip_rows_splice.extend(res['clip_rows_splice'])
         clip_rows_nonsplice.extend(res['clip_rows_nonsplice'])
-        ltr_exon_rows.extend(res['ltr_exon_rows'])
+        elem_exon_rows.extend(res['elem_exon_rows'])
         gene_exon_rows.extend(res['gene_exon_rows'])
 
-        # Merge strand inference votes
-        for eid, votes in res['infer_votes'].items():
-            if eid not in global_infer_votes:
-                global_infer_votes[eid] = {'+':0, '-':0}
-            global_infer_votes[eid]['+'] += votes['+']
-            global_infer_votes[eid]['-'] += votes['-']
+    # Resolve orientation for features annotated with an unknown strand. Reads were bucketed by
+    # their own strand; the better-supported bucket defines the element strand, and therefore
+    # which bucket is sense.
+    unknown = defaultdict(dict)
+    for (fid, orient) in list(stats):
+        if orient in ('rs+', 'rs-'):
+            unknown[fid][orient] = stats[(fid, orient)]['total']
 
-    # Apply majority strand inference back to elem_info
-    for eid, counts in global_infer_votes.items():
-        elem_info[eid]['strand'] = '+' if counts['+'] >= counts['-'] else '-'
+    n_inferred = 0
+    for fid, buckets in unknown.items():
+        plus = buckets.get('rs+', 0)
+        minus = buckets.get('rs-', 0)
+        inferred = '+' if plus >= minus else '-'
+        feat_info[fid]['strand'] = inferred
+        feat_info[fid]['strand_source'] = 'inferred'
+        sense_key = 'rs+' if inferred == '+' else 'rs-'
+        for orient in ('rs+', 'rs-'):
+            old = (fid, orient)
+            if old not in stats:
+                continue
+            new = (fid, 'sense' if orient == sense_key else 'antisense')
+            stats[new] = stats.pop(old)
+            tss_positions[new] = tss_positions.pop(old)
+            end_positions[new] = end_positions.pop(old)
+        n_inferred += 1
 
     print(f"Classification complete in {(time.time() - start_time) / 60:.1f} minutes.")
-    print(f"Strand counts across all reads: {strand_counts}")
+    print(f"Strand counts across all reads: {dict(strand_counts)}")
+    print(f"Features with reads: {len({f for f, _ in stats})} "
+          f"({n_inferred} had their strand inferred from read support)")
+    obs = Counter(feat_info[f]['class'] for f in {f for f, _ in stats})
+    print("  by class: " + ", ".join(f"{k}={v}" for k, v in sorted(obs.items())))
+    orient_totals = Counter()
+    for (fid, orient), rec in stats.items():
+        orient_totals[orient] += rec['total']
+    print(f"  reads by orientation: {dict(orient_totals)}")
 
-    # Write output files (unchanged) ----------------------------------------
-    if clip_out_splice:
-        with open(clip_out_splice, "w") as out:
-            out.write("\t".join([
-                "EID","Chrom","Origin","LTR_side","Category","Read","MAPQ","is_reverse",
-                "softclip_3p","aln_start","aln_end"
-            ]) + "\n")
-            for row in clip_rows_splice:
+    # ---- per-read outputs ----
+    read_hdr = ["Feature", "Class", "Orientation", "Chrom", "TSS", "Category",
+                "Read", "MAPQ", "Aln_Reverse", "softclip_3p", "aln_start", "aln_end",
+                "Nested_In", "Terminates_In"]
+    exon_hdr = ["Feature", "Class", "Orientation", "Chrom", "TSS", "Category",
+                "Read", "MAPQ", "Aln_Reverse",
+                "exon_count", "intron_count", "exon_len_combined", "intron_len_combined",
+                "exon1", "intron1", "exon2", "intron2", "exon3", "intron3",
+                "exon4", "intron4", "exon5", "Nested_In", "Terminates_In"]
+
+    for path, rows, hdr, label in (
+            (clip_out_splice, clip_rows_splice, read_hdr, "spliced reads"),
+            (clip_out_nonsplice, clip_rows_nonsplice, read_hdr, "non-spliced reads"),
+            (elem_exon_out, elem_exon_rows, exon_hdr, "TE exon statistics"),
+            (gene_exon_out, gene_exon_rows, exon_hdr, "gene exon statistics")):
+        if not path:
+            continue
+        with open(path, "w") as out:
+            out.write("\t".join(hdr) + "\n")
+            for row in rows:
                 out.write("\t".join(map(str, row)) + "\n")
-        print(f"Wrote 3' soft-clipping records for spliced reads to {clip_out_splice}")
+        print(f"Wrote {len(rows)} {label} records to {path}")
 
-    if clip_out_nonsplice:
-        with open(clip_out_nonsplice, "w") as out:
-            out.write("\t".join([
-                "EID","Chrom","Origin","LTR_side","Category","Read","MAPQ","is_reverse",
-                "softclip_3p","aln_start","aln_end"
-            ]) + "\n")
-            for row in clip_rows_nonsplice:
-                out.write("\t".join(map(str, row)) + "\n")
-        print(f"Wrote 3' soft-clipping records for non-spliced reads to {clip_out_nonsplice}")
+    return stats, tss_positions, end_positions
 
-    if ltr_exon_out:
-        with open(ltr_exon_out, "w") as out:
-            out.write("\t".join([
-                "EID","Chrom","Origin","Category","Read","MAPQ","is_reverse",
-                "exon_count","intron_count","exon_len_combined","intron_len_combined",
-                "exon1","intron1","exon2","intron2","exon3","intron3","exon4","intron4","exon5"
-            ]) + "\n")
-            for row in ltr_exon_rows:
-                out.write("\t".join(map(str, row)) + "\n")
-        print(f"Wrote LTR-RT exon statistics to {ltr_exon_out}")
 
-    if gene_exon_out:
-        with open(gene_exon_out, "w") as out:
-            out.write("\t".join([
-                "GeneID","Chrom","Origin","Read","MAPQ","is_reverse",
-                "exon_count","intron_count","exon_len_combined","intron_len_combined",
-                "exon1","intron1","exon2","intron2","exon3","intron3","exon4","intron4","exon5"
-            ]) + "\n")
-            for row in gene_exon_rows:
-                out.write("\t".join(map(str, row)) + "\n")
-        print(f"Wrote Gene exon statistics to {gene_exon_out}")
+# ---------------------------------------------------------------------------
+# Output writers
+# ---------------------------------------------------------------------------
 
-    return stats, tss_positions, end_positions, gene_stats, gene_tss
-    
-def write_tsv(elem_info, stats, prefix, qual_scores=None):
+def _report_cats(include_partial):
+    return [c for c in ALL_CATS if include_partial or c != 'partial']
+
+
+def _pooled_origins(tss_positions, key):
+    out = []
+    for lst in tss_positions[key].values():
+        out.extend(lst)
+    return out
+
+
+def _read_frame_strand(rec, orient):
+    """Transcription strand of the reads in a record: flipped from the element for antisense."""
+    s = rec.get('strand', '.')
+    if orient == 'antisense':
+        return '-' if s == '+' else ('+' if s == '-' else '.')
+    return s
+
+
+def write_isoform_tables(feat_info, body_tree, stats, tss_positions, prefix, args):
     """
-    Write the per-element LTR summary TSV.
+    Write per-feature isoform tables, split into sense and antisense files.
 
-    Parameters
-    ----------
-    qual_scores : dict or None
-        Optional mapping of eid -> {'mean': float|'NA', 'median': float|'NA'}
-        as returned by compute_base_quality_scores(). When provided, two extra
-        columns are appended: mean_base_qual and median_base_qual.
+    Every feature reports against the union vocabulary; categories outside a feature's own
+    vocabulary stay at zero (a gene never has an ltr5_contained read, a fragment never has a
+    spanning one). Nesting parents are computed only for features that received reads.
     """
-    cats = ['ltr_left','ltr_right','spanning','ro5','ro3']
-    rows = []
-    for eid, info in elem_info.items():
-        rec = stats[eid]
+    cats = _report_cats(args.include_partial)
+    parent_cache = {}
+    rows_by_orient = defaultdict(list)
+
+    for (fid, orient), rec in stats.items():
+        info = feat_info[fid]
         total = rec['total']
+        if total == 0:
+            continue
+
+        if fid not in parent_cache:
+            parents = nesting_parents(fid, feat_info, body_tree)
+            parent_cache[fid] = (parents,
+                                 [feat_info[p]['class'] for p in parents])
+        parents, parent_classes = parent_cache[fid]
+
+        peak, _peak_cnt, peak_frac, called = compute_tss_peak(
+            _pooled_origins(tss_positions, (fid, orient)),
+            args.tss_window, args.tss_min_frac)
+
         row = {
-            'chrom': info['chrom'], 'name': info['name'],
-            'start': info['start'], 'end': info['end'],
-            'attrs': info['attrs'], 'total_reads': total
+            'Feature': fid,
+            'Chrom': info['chrom'],
+            'Start': info['start'],
+            'End': info['end'],
+            'Class': info['class'],
+            'Name': info['name'],
+            'Strand': info['strand'],
+            'Strand_Source': info.get('strand_source', 'annotated'),
+            'Orientation': orient,
+            'Total_Reads': total,
+            'Nested_In': ";".join(parents) if parents else "NA",
+            'Nested_In_Class': ";".join(parent_classes) if parents else "NA",
+            'TSS_Called': called,
+            'TSS_Peak': peak,
+            'TSS_Peak_Frac': f"{peak_frac:.4f}",
         }
         for cat in cats:
             count = rec['counts'][cat]
-            pct = count/total*100 if total else 0
-            mean_len = rec['lengths'][cat]/count if count else 0
-            spc = rec['spliced'][cat]
-            junc_count = len(rec['junctions'][cat])
-            row.update({
-                f'{cat}_reads': count,
-                f'{cat}_pct': f"{pct:.2f}",
-                f'mean_len_{cat}': f"{mean_len:.1f}",
-                f'spliced_{cat}': spc,
-                f'unique_juncts_{cat}': junc_count
-            })
-        rows.append(row)
+            row[f'{cat}_reads'] = count
+            row[f'mean_len_{cat}'] = f"{rec['lengths'][cat] / count:.1f}" if count else "0.0"
+            # 'n_spliced_' rather than 'spliced_': several categories are themselves named
+            # spliced_*, and 'spliced_spanning' as a counter prefix collided with the
+            # spliced_spanning category's own columns.
+            if cat not in SPLICED_BY_DEF and cat not in UNSPLICED_BY_DEF:
+                row[f'n_spliced_{cat}'] = rec['spliced'][cat]
+            if cat not in UNSPLICED_BY_DEF:
+                row[f'unique_juncts_{cat}'] = len(rec['junctions'][cat])
+        row['Attrs'] = info['attrs']
+        rows_by_orient[orient].append(row)
 
-    df = pd.DataFrame(rows).sort_values('total_reads', ascending=False)
-    out_path = prefix + '.tsv'
-    df.to_csv(out_path, sep='\t', index=False)
-    print(f"Wrote LTR summary to {out_path}")
+    for orient in ('sense', 'antisense'):
+        out_path = f"{prefix}_{orient}.isoforms.tsv"
+        rows = rows_by_orient.get(orient, [])
+        if rows:
+            df = pd.DataFrame(rows).sort_values('Total_Reads', ascending=False)
+        else:
+            df = pd.DataFrame(columns=['Feature', 'Chrom', 'Start', 'End', 'Class', 'Orientation',
+                                       'Total_Reads'])
+        df.to_csv(out_path, sep='\t', index=False)
+        print(f"Wrote {len(rows)} {orient} isoform records to {out_path}")
 
 
-def write_isoform_tss_summary(stats, tss_positions, out_path):
+def write_isoform_tss_summary(feat_info, stats, tss_positions, out_path, args, n=2,
+                              orient_filter=None):
+    """
+    Top isoform and top-n TSS positions per feature and orientation.
+
+    orient_filter restricts output to one orientation. Downstream tools that key a lookup on
+    Feature (WindowScrubber builds tss_map[Feature] from TSS1) need one row per feature, so the
+    orientation-split copies rather than the combined table are what should be fed to them.
+    """
+    cats = _report_cats(args.include_partial)
     with open(out_path, 'w') as out:
-        out.write("Feature\tTop_Isoform\tTop_Isoform_Strand\tTotal_Reads\tTSS1\tCount1\tTSS2\tCount2\n")
-        for eid, rec in stats.items():
-            total = rec['total']
-            if total == 0:
-                continue
-            top_cat = max(rec['counts'], key=rec['counts'].get)
-            common = Counter(tss_positions[eid][top_cat]).most_common(2)
-            (tss1,c1),(tss2,c2) = (common + [( 'NA',0),( 'NA',0) ])[:2]
-
-            strand_counts = Counter([s for s in rec.get('strands', {}).get(top_cat, []) if s in ('+','-')])
-            strand = strand_counts.most_common(1)[0][0] if strand_counts else 'NA'
-
-            out.write(f"{eid}\t{top_cat}\t{strand}\t{total}\t{tss1}\t{c1}\t{tss2}\t{c2}\n")
-    print(f"Wrote LTR TSS summary to {out_path}")
-    
-
-def write_isoform_tss_summary_top_n(stats, tss_positions, end_positions, tss_out_path, cleave_out_path, n=10):
-    """
-    Writes Feature, Strand, Total_Reads, then TSS1,Count1,...,TSSn,Countn
-    up to n sites (pads with NA if fewer). Counts are drawn from the full
-    distribution of TSS positions (not just the top n).
-    """
-     # ---------- TSS ----------
-    with open(tss_out_path, "w") as out:
-        hdr = ["Feature", "Strand", "Total_Reads"]
+        hdr = ["Feature", "Class", "Orientation", "Top_Isoform", "Strand", "Total_Reads",
+               "TSS_Called", "TSS_Peak_Frac"]
         for i in range(1, n + 1):
             hdr += [f"TSS{i}", f"Count{i}"]
         out.write("\t".join(hdr) + "\n")
 
-        for eid, rec in stats.items():
-            total = rec.get("total", 0)
-            if total == 0:
+        for (fid, orient), rec in stats.items():
+            total = rec['total']
+            if total == 0 or (orient_filter and orient != orient_filter):
+                continue
+            info = feat_info[fid]
+            top_cat = max(cats, key=lambda c: rec['counts'][c])
+            if rec['counts'][top_cat] == 0:
                 continue
 
-            top_cat = max(rec["counts"], key=rec["counts"].get)
+            origins = _pooled_origins(tss_positions, (fid, orient))
+            peak, peak_cnt, peak_frac, called = compute_tss_peak(
+                origins, args.tss_window, args.tss_min_frac)
 
-            ctr = Counter(tss_positions[eid][top_cat])
-            top_n = ctr.most_common(n)
-            top_n += [("NA", 0)] * (n - len(top_n))
+            # Pooled across categories, matching TSS_Peak in the isoform table. Ranking only
+            # the top category made TSS1 here a different quantity from TSS_Peak there.
+            common = Counter(origins).most_common(n)
+            common += [("NA", 0)] * (n - len(common))
 
-            strands = rec.get("strands", {}).get(top_cat, [])
-            strand = Counter(s for s in strands if s in ("+", "-")).most_common(1)
-            strand = strand[0][0] if strand else "NA"
-
-            row = [eid, strand, str(total)]
-            for tss, cnt in top_n:
+            row = [fid, info['class'], orient, top_cat, _read_frame_strand(info, orient),
+                   str(total), str(called), f"{peak_frac:.4f}"]
+            for tss, cnt in common:
                 row += [str(tss), str(cnt)]
             out.write("\t".join(row) + "\n")
+    print(f"Wrote isoform TSS summary to {out_path}")
 
-    # ---------- Cleavage ----------
-    window = 5
-    with open(cleave_out_path, "w") as out:
-        hdr = ["Feature", "Strand", "Total_Reads",
-            "CleavageSitePeak", "CleavageSiteCnt", "CleavageSiteFrac",
-            f"PeakWindow{window}_Cnt", f"PeakWindow{window}_Frac"]
+
+def write_cleavage_summary(feat_info, stats, end_positions, out_path, args, n=10, window=5):
+    """3'-end (cleavage) distribution per feature and orientation, pooled across categories."""
+    with open(out_path, "w") as out:
+        hdr = ["Feature", "Class", "Orientation", "Strand", "Total_Reads",
+               "CleavageSitePeak", "CleavageSiteCnt", "CleavageSiteFrac",
+               f"PeakWindow{window}_Cnt", f"PeakWindow{window}_Frac"]
         for i in range(1, n + 1):
             hdr += [f"End{i}", f"Count{i}"]
         out.write("\t".join(hdr) + "\n")
 
-        for eid, rec in stats.items():
-            # collect ALL end positions across ALL categories
+        for (fid, orient), rec in stats.items():
             all_ends = []
-            all_strands = []
             for cat, cnt in rec["counts"].items():
-                if cnt == 0:
-                    continue
-                all_ends.extend(end_positions[eid][cat])
-                all_strands.extend(rec.get("strands", {}).get(cat, []))
-
-            ctr = Counter(all_ends)
-            total = sum(ctr.values())  # safest denominator
-
-            if total == 0:
+                if cnt:
+                    all_ends.extend(end_positions[(fid, orient)][cat])
+            if not all_ends:
                 continue
 
+            ctr = Counter(all_ends)
+            total = sum(ctr.values())
             common = ctr.most_common()
             top_n = common[:n] + [("NA", 0)] * (n - len(common[:n]))
 
             peak_site, peak_cnt = common[0]
-            cleave_frac = peak_cnt / total
+            peak_window_cnt = sum(v for pos, v in ctr.items() if abs(pos - peak_site) <= window)
 
-            peak_window_cnt = sum(v for pos, v in ctr.items()
-                                if abs(pos - peak_site) <= window)
-            peak_window_frac = peak_window_cnt / total
-
-            strand = Counter(s for s in all_strands if s in ("+", "-")).most_common(1)
-            strand = strand[0][0] if strand else "NA"
-
-            row = [eid, strand, str(total),
-                str(peak_site), str(peak_cnt), f"{cleave_frac:.4f}",
-                str(peak_window_cnt), f"{peak_window_frac:.4f}"]
+            info = feat_info[fid]
+            row = [fid, info['class'], orient, _read_frame_strand(info, orient), str(total),
+                   str(peak_site), str(peak_cnt), f"{peak_cnt / total:.4f}",
+                   str(peak_window_cnt), f"{peak_window_cnt / total:.4f}"]
             for end, cnt in top_n:
                 row += [str(end), str(cnt)]
-
             out.write("\t".join(row) + "\n")
+    print(f"Wrote top-{n} cleavage summary to {out_path}")
 
-        print(f"Wrote top-{n} LTR TSS summary to {tss_out_path}")
-        print(f"Wrote top-{n} LTR cleavage summary to {cleave_out_path}")
 
-def write_gene_summary(gene_stats, gene_tss, out_path):
+def write_gene_summary(feat_info, stats, tss_positions, out_path, args, n=2):
+    """Gene read counts and top-n TSS positions, one row per gene and orientation."""
     with open(out_path, 'w') as out:
-        out.write("Gene\tTotal_Reads\tTSS1\tCount1\tTSS2\tCount2\n")
-        for gid, rec in gene_stats.items():
-            total = rec['total']
-            if total == 0:
+        hdr = ["Gene", "Orientation", "Total_Reads", "TSS_Called", "TSS_Peak_Frac"]
+        for i in range(1, n + 1):
+            hdr += [f"TSS{i}", f"Count{i}"]
+        out.write("\t".join(hdr) + "\n")
+
+        n_rows = 0
+        for (fid, orient), rec in stats.items():
+            if feat_info[fid]['class'] != 'Gene' or rec['total'] == 0:
                 continue
-            common = Counter(gene_tss[gid]).most_common(2)
-            (tss1,c1),(tss2,c2) = (common + [( 'NA',0),( 'NA',0) ])[:2]
-            out.write(f"{gid}\t{total}\t{tss1}\t{c1}\t{tss2}\t{c2}\n")
-    print(f"Wrote gene summary to {out_path}")
-
-def write_gene_summary_top_n(gene_stats, gene_tss, out_path, n=10):
-    """
-    Writes a tab-delimited file with columns:
-      Gene, Total_Reads,
-      TSS1, Count1, ..., TSSn, Countn
-    Up to n sites. Counts are drawn from the full
-    distribution of gene_tss positions (not just the top n).
-    """
-    with open(out_path, 'w') as out:
-        # header
-        headers = ["Gene", "Total_Reads"]
-        for i in range(1, n+1):
-            headers += [f"TSS{i}", f"Count{i}"]
-        out.write("\t".join(headers) + "\n")
-
-        for gid, rec in gene_stats.items():
-            total = rec.get('total', 0)
-            if total == 0:
-                continue
-
-            # build full Counter over gene-TSS positions
-            ctr = Counter(gene_tss.get(gid, []))
-            common_full = ctr.most_common()
-            # slice to top-n and pad
-            top_n = common_full[:n]
-            top_n += [("NA", 0)] * (n - len(top_n))
-
-            # assemble row
-            row = [gid, str(total)]
-            for tss, cnt in top_n:
+            origins = _pooled_origins(tss_positions, (fid, orient))
+            _, _, peak_frac, called = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
+            common = Counter(origins).most_common(n)
+            common += [("NA", 0)] * (n - len(common))
+            row = [fid, orient, str(rec['total']), str(called), f"{peak_frac:.4f}"]
+            for tss, cnt in common:
                 row += [str(tss), str(cnt)]
-
             out.write("\t".join(row) + "\n")
+            n_rows += 1
+    print(f"Wrote {n_rows} gene summary records to {out_path}")
 
-    print(f"Wrote top-{n} gene TSS summary to {out_path}")
 
-
-# ---------------------------------------------------------------------------
-# U3 / Promoter Sequence Extraction
-# ---------------------------------------------------------------------------
-def _extract_region(chrom_seq, start1, end1, strand):
+def compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=1,
+                        include_tss_reads=True, klass=None):
     """
-    Extract 1-based inclusive [start1, end1] from chrom_seq (a Bio.Seq.Seq)
-    and reverse-complement if strand == '-'.
-    """
-    seq = chrom_seq[start1 - 1:end1]
-    return seq.reverse_complement() if strand == '-' else seq
+    Per feature and orientation, histograms of read 5' ends around the primary and secondary TSS.
 
-
-def u3_seq_extraction(genome_fasta, elem_info, gene_info,
-                      stats, tss_positions, gene_tss, gene_stats,
-                      output_prefix):
-    """
-    Extract U3/LTR sequences for LTR elements and promoter regions for genes.
-
-    Reuses the data structures already computed by IsoClassifier:
-      - elem_info  : dict of LTR element metadata (0-based coords)
-      - gene_info  : dict of gene metadata (0-based coords)
-      - stats / tss_positions : per-element classification results
-      - gene_tss / gene_stats : per-gene TSS positions and read counts
-
-    LTR mode outputs:
-      <prefix>_u3_seqs.fa   — U3 region sequences
-      <prefix>_ltr_seqs.fa  — Full LTR sequences (TSS-containing LTR)
-
-    Gene mode outputs:
-      <prefix>_gene_2kb_proms.bed  — BED of ±1000 bp around primary TSS
-      <prefix>_gene_2kb_proms.fa   — Strand-aware FASTA of promoter regions
-      <prefix>_gene_dummy_u3.fa    — Dummy U3 FASTA (NNNNN) for upstream 1 kb
-    """
-    print("Loading genome FASTA for U3/promoter extraction...")
-    genome = SeqIO.to_dict(SeqIO.parse(genome_fasta, 'fasta'))
-    print(f"Loaded {len(genome)} sequences from genome FASTA.")
-
-    # ---- LTR mode ----
-    u3_records = []
-    ltr_records = []
-
-    for eid, rec in stats.items():
-        total = rec.get('total', 0)
-        if total == 0:
-            continue
-
-        element = elem_info.get(eid)
-        if not element:
-            continue
-
-        chrom = element['chrom']
-        strand = element.get('strand', '.')
-
-        # Determine strand fallback from top isoform
-        top_cat = max(rec['counts'], key=rec['counts'].get)
-        if strand not in ('+', '-'):
-            strand_list = rec.get('strands', {}).get(top_cat, [])
-            scounts = Counter(s for s in strand_list if s in ('+', '-'))
-            if scounts:
-                strand = scounts.most_common(1)[0][0]
-            else:
-                logging.warning(f"[U3] No valid strand for {eid}; skipping")
-                continue
-
-        # Get primary TSS (0-based from IsoClassifier)
-        common = Counter(tss_positions[eid][top_cat]).most_common(1)
-        if not common:
-            continue
-        tss0 = common[0][0]   # 0-based
-        tss1 = tss0 + 1       # convert to 1-based for sequence extraction
-
-        ltr_left = element.get('ltr_left')    # (start0, end0) 0-based half-open
-        ltr_right = element.get('ltr_right')
-        if not ltr_left or not ltr_right:
-            continue
-
-        # Determine which LTR contains the TSS (using 0-based coords)
-        chosen = None
-        if ltr_left[0] <= tss0 < ltr_left[1]:
-            chosen = ltr_left
-        elif ltr_right[0] <= tss0 < ltr_right[1]:
-            chosen = ltr_right
-
-        if not chosen:
-            logging.warning(f"[U3] TSS {tss0} not in lLTR or rLTR of {eid}; skipping")
-            continue
-
-        chrom_rec = genome.get(chrom)
-        if not chrom_rec:
-            logging.warning(f"[U3] Chrom {chrom} not in genome; skipping {eid}")
-            continue
-
-        # U3 boundary: from inner edge of LTR to TSS
-        # On '+': boundary = chosen[0] (0-based start), convert to 1-based = chosen[0]+1
-        # On '-': boundary = chosen[1] (0-based half-open end), 1-based = chosen[1]
-        boundary1 = (chosen[0] + 1) if strand == '+' else chosen[1]
-        u3_start1, u3_end1 = sorted((tss1, boundary1))
-
-        u3_seq = _extract_region(chrom_rec.seq, u3_start1, u3_end1, strand)
-        u3_hdr = f"{eid}|{chrom}:{u3_start1}-{u3_end1}({strand})"
-        u3_records.append(SeqRecord(u3_seq, id=u3_hdr, description=""))
-
-        # Full LTR (same side as TSS), convert 0-based half-open to 1-based inclusive
-        full_start1 = chosen[0] + 1
-        full_end1 = chosen[1]
-        full_seq = _extract_region(chrom_rec.seq, full_start1, full_end1, strand)
-        ltr_hdr = f"{eid}|{chrom}:{full_start1}-{full_end1}({strand})"
-        ltr_records.append(SeqRecord(full_seq, id=ltr_hdr, description=""))
-
-    u3_out = output_prefix + '_u3_seqs.fa'
-    ltr_out = output_prefix + '_ltr_seqs.fa'
-    SeqIO.write(u3_records, u3_out, 'fasta')
-    print(f"[U3-LTR] Wrote {len(u3_records)} U3 sequences to {u3_out}")
-    SeqIO.write(ltr_records, ltr_out, 'fasta')
-    print(f"[U3-LTR] Wrote {len(ltr_records)} full LTR sequences to {ltr_out}")
-
-    # ---- Gene mode ----
-    gene_u3_records = []
-    promoter_records = []
-    n_written = 0
-
-    bed_path = output_prefix + '_gene_2kb_proms.bed'
-    prom_fa_path = output_prefix + '_gene_2kb_proms.fa'
-    gene_u3_path = output_prefix + '_gene_dummy_u3.fa'
-
-    with open(bed_path, 'w') as bed_out:
-        for gid, positions in gene_tss.items():
-            if not positions:
-                continue
-            grec = gene_stats.get(gid, {})
-            if grec.get('total', 0) == 0:
-                continue
-
-            ginfo = gene_info.get(gid)
-            if not ginfo:
-                continue
-
-            chrom = ginfo['chrom']
-            strand = ginfo['strand']
-            if strand not in ('+', '-'):
-                logging.warning(f"[Gene] {gid} has invalid strand '{strand}'; skipping")
-                continue
-
-            chrom_rec = genome.get(chrom)
-            if not chrom_rec:
-                logging.warning(f"[Gene] Chrom {chrom} not in genome; skipping {gid}")
-                continue
-            chrom_len = len(chrom_rec.seq)
-
-            # Primary TSS (0-based from IsoClassifier)
-            tss0 = Counter(positions).most_common(1)[0][0]
-            tss1 = tss0 + 1  # 1-based
-
-            # Promoter: ±1000 bp around TSS (genomic coords)
-            prom_start0 = max(0, tss1 - 1000)      # 0-based start
-            prom_end1 = min(tss1 + 1000, chrom_len) # 1-based end
-
-            # BED line (0-based start, half-open end)
-            bed_out.write(f"{chrom}\t{prom_start0}\t{prom_end1}\t{gid}\t0\t{strand}\n")
-
-            # Promoter FASTA (strand-aware)
-            prom_start1 = prom_start0 + 1
-            prom_seq = _extract_region(chrom_rec.seq, prom_start1, prom_end1, strand)
-            prom_hdr = f"{gid}|{chrom}:{prom_start0}-{prom_end1}({strand})"
-            promoter_records.append(SeqRecord(prom_seq, id=prom_hdr, description=""))
-
-            # Dummy U3: upstream 1 kb header with NNNNN sequence
-            if strand == '+':
-                u3_start0 = max(0, tss1 - 1000)
-                u3_end1_g = tss1
-            else:
-                u3_start0 = tss1
-                u3_end1_g = min(tss1 + 1000, chrom_len)
-
-            u3_hdr = f"{gid}|{chrom}:{u3_start0}-{u3_end1_g}({strand})"
-            gene_u3_records.append(SeqRecord(Seq("NNNNN"), id=u3_hdr, description=""))
-            n_written += 1
-
-    SeqIO.write(promoter_records, prom_fa_path, 'fasta')
-    print(f"[Gene] Wrote {n_written} promoter entries to {bed_path} and {prom_fa_path}")
-    SeqIO.write(gene_u3_records, gene_u3_path, 'fasta')
-    print(f"[Gene] Wrote {n_written} dummy U3 sequences to {gene_u3_path}")
-
-    
-# Computes TSS density for histograms around the primary and secondary TSS for each feature, 
-# with strand-aware distances and optional inclusion of reads at the TSS.
-def compute_tss_density_separate(stats, tss_positions, elem_info,
-                                 window=10, min_reads=1, include_tss_reads=True):
-    """
-    For each feature in stats:
-      - find the two most common TSS (primary, secondary)
-      - collect *all* read‐end origins
-      - build TWO histograms (±window):
-         • hist1 around primary TSS, dropping only reads == primary
-         • hist2 around secondary TSS, dropping only reads == secondary
-      - strand‐aware: on '-' features flip the sign of (o - TSS)
-      - If include_tss_reads=True, reads at the TSS (distance==0) are INCLUDED.
-    Returns:
-      density: dict mapping feature_id ->
-        { 'primary': np.array(length=2*window+1),
-          'secondary': np.array(length=2*window+1) }
+    Distances are measured in the read's frame, so positive is always downstream of the TSS in the
+    direction of transcription -- for antisense records that is the opposite genomic direction from
+    the element's annotated strand.
     """
     density = {}
     size = 2 * window + 1
 
-    for fid, rec in stats.items():
-        total = rec.get('total', 0)
-        if total < min_reads:
+    for (fid, orient), rec in stats.items():
+        if rec.get('total', 0) < min_reads:
+            continue
+        info = feat_info[fid]
+        if klass is not None and info['class'] != klass:
+            continue
+        if klass is None and info['class'] == 'Gene':
             continue
 
-        # pick primary & secondary TSS
-        top_cat = max(rec['counts'], key=rec['counts'].get)
-        common = Counter(tss_positions[fid][top_cat]).most_common(2)
-        while len(common) < 2:
-            common.append((None, 0))
-        (tss1, _), (tss2, _) = common
-        if tss1 is None:
-            continue
-
-        # collect all read origins for this feature
-        origins = []
-        for lst in tss_positions[fid].values():
-            origins.extend(lst)
-
-        # strand-aware distance
-        strand = elem_info[fid].get('strand', '+')
-        def stranded_dist(o, t):
-            d = o - t
-            return -d if strand == '-' else d
-
-        hist1 = np.zeros(size, dtype=int)
-        hist2 = np.zeros(size, dtype=int)
-
-        # primary window (now INCLUDING reads at TSS1 if include_tss_reads=True)
-        for o in origins:
-            if not include_tss_reads and o == tss1:
-                continue
-            d = stranded_dist(o, tss1)
-            if -window <= d <= window:
-                hist1[d + window] += 1
-
-        # secondary window (same inclusion behavior)
-        if tss2 is not None:
-            for o in origins:
-                if not include_tss_reads and o == tss2:
-                    continue
-                d = stranded_dist(o, tss2)
-                if -window <= d <= window:
-                    hist2[d + window] += 1
-
-        density[fid] = {'primary': hist1, 'secondary': hist2}
-
-    return density
-
-def compute_gene_tss_density_separate(gene_stats, gene_tss, gene_info,
-                                      window=10, min_reads=5, include_tss_reads=True):
-    """
-    For each gene in gene_stats:
-      - Identify the two most common TSS positions from gene_tss[gid]
-      - Build two histograms (length 2*window+1):
-         • hist1: counts of ALL read-ends within ±window of primary TSS
-         • hist2: counts of ALL read-ends within ±window of secondary TSS
-        (If include_tss_reads=True, reads exactly at the TSS are INCLUDED.)
-      - Strand-aware: distances on '-' genes are flipped so upstream is positive.
-
-    Returns:
-      dict: gid -> {'primary': hist1, 'secondary': hist2}
-    """
-    density = {}
-    size = 2 * window + 1
-
-    for gid, rec in gene_stats.items():
-        total = rec.get('total', 0)
-        if total < min_reads:
-            continue
-
-        origins = gene_tss.get(gid, [])
+        origins = _pooled_origins(tss_positions, (fid, orient))
         if not origins:
             continue
-
-        # primary & secondary TSS
         common = Counter(origins).most_common(2)
         while len(common) < 2:
             common.append((None, 0))
@@ -1334,118 +1474,220 @@ def compute_gene_tss_density_separate(gene_stats, gene_tss, gene_info,
         if tss1 is None:
             continue
 
-        # strand-aware distance
-        strand = gene_info.get(gid, {}).get('strand', '+')
-        def stranded_dist(o, t):
-            d = o - t
-            return -d if strand == '-' else d
-
+        strand = _read_frame_strand(info, orient)
         hist1 = np.zeros(size, dtype=int)
         hist2 = np.zeros(size, dtype=int)
 
-        # primary window
-        for o in origins:
-            if not include_tss_reads and o == tss1:
+        for target, hist in ((tss1, hist1), (tss2, hist2)):
+            if target is None:
                 continue
-            d = stranded_dist(o, tss1)
-            if -window <= d <= window:
-                hist1[d + window] += 1
-
-        # secondary window
-        if tss2 is not None:
             for o in origins:
-                if not include_tss_reads and o == tss2:
+                if not include_tss_reads and o == target:
                     continue
-                d = stranded_dist(o, tss2)
+                d = o - target
+                if strand == '-':
+                    d = -d
                 if -window <= d <= window:
-                    hist2[d + window] += 1
+                    hist[d + window] += 1
 
-        density[gid] = {'primary': hist1, 'secondary': hist2}
+        density[(fid, orient)] = {'primary': hist1, 'secondary': hist2}
 
     return density
 
+
+def write_density(density, out_path, which, window=10, label="Feature"):
+    with open(out_path, 'w') as out:
+        out.write(f"{label}\tOrientation\tDistance\tCount\n")
+        for (fid, orient), hists in density.items():
+            for i, cnt in enumerate(hists[which]):
+                out.write(f"{fid}\t{orient}\t{i - window}\t{cnt}\n")
+    print(f"Wrote {which} TSS densities to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# U3 / Promoter Sequence Extraction
+# ---------------------------------------------------------------------------
+
+def _extract_region(fa, chrom, start1, end1, strand):
+    """Extract 1-based inclusive [start1, end1] and reverse-complement if strand == '-'."""
+    seq = Seq(fa.fetch(chrom, start1 - 1, end1))
+    return seq.reverse_complement() if strand == '-' else seq
+
+
+def u3_seq_extraction(genome_fasta, feat_info, stats, tss_positions, output_prefix, args):
+    """
+    Extract U3/LTR sequences for structural LTR-RTs and promoter regions for genes.
+
+    U3 extraction is restricted to LTR_structural: fragments have no resolved LTR pair and DNA
+    transposons have no U3 at all. Both orientations are emitted so antisense initiation can be
+    compared against the canonical U3-driven TSS downstream. The upstream LTR boundary and the
+    reverse-complement are both taken in the read's frame, so an antisense record measures back
+    to the edge of the LTR the antisense transcript actually initiated in.
+    """
+    print("Opening genome FASTA for U3/promoter extraction...")
+    fa = pysam.FastaFile(genome_fasta)
+    contigs = set(fa.references)
+
+    records = {('u3', 'sense'): [], ('u3', 'antisense'): [],
+               ('ltr', 'sense'): [], ('ltr', 'antisense'): []}
+    n_skipped = Counter()
+
+    for (fid, orient), rec in stats.items():
+        if rec.get('total', 0) == 0:
+            continue
+        info = feat_info[fid]
+        if info['class'] != 'LTR_structural':
+            continue
+
+        chrom = info['chrom']
+        if chrom not in contigs:
+            n_skipped['contig missing from genome'] += 1
+            continue
+
+        tstrand = _read_frame_strand(info, orient)
+        if tstrand not in ('+', '-'):
+            n_skipped['unresolved strand'] += 1
+            continue
+
+        origins = _pooled_origins(tss_positions, (fid, orient))
+        peak, _, _, _ = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
+        if peak == 'NA':
+            continue
+        tss0 = peak
+        tss1 = tss0 + 1
+
+        ltr_left, ltr_right = info['ltr_left'], info['ltr_right']
+        if not ltr_left or not ltr_right:
+            continue
+
+        if ltr_left[0] <= tss0 < ltr_left[1]:
+            chosen = ltr_left
+        elif ltr_right[0] <= tss0 < ltr_right[1]:
+            chosen = ltr_right
+        else:
+            n_skipped['TSS outside both LTRs'] += 1
+            continue
+
+        # Upstream LTR edge in the read's frame
+        boundary1 = (chosen[0] + 1) if tstrand == '+' else chosen[1]
+        u3_start1, u3_end1 = sorted((tss1, boundary1))
+
+        u3_seq = _extract_region(fa, chrom, u3_start1, u3_end1, tstrand)
+        records[('u3', orient)].append(SeqRecord(
+            u3_seq, id=f"{fid}|{chrom}:{u3_start1}-{u3_end1}({tstrand})|{orient}", description=""))
+
+        full_start1, full_end1 = chosen[0] + 1, chosen[1]
+        records[('ltr', orient)].append(SeqRecord(
+            _extract_region(fa, chrom, full_start1, full_end1, tstrand),
+            id=f"{fid}|{chrom}:{full_start1}-{full_end1}({tstrand})|{orient}", description=""))
+
+    for (kind, orient), recs in records.items():
+        path = f"{output_prefix}_{kind}_seqs_{orient}.fa"
+        SeqIO.write(recs, path, 'fasta')
+        print(f"[U3-LTR] Wrote {len(recs)} {kind} sequences to {path}")
+    if n_skipped:
+        print("  skipped: " + ", ".join(f"{k}={v}" for k, v in n_skipped.items()))
+
+    # ---- Gene promoters (sense only; the antisense 5' end is not the annotated promoter) ----
+    promoter_records = []
+    gene_u3_records = []
+    bed_path = output_prefix + '_gene_2kb_proms.bed'
+    prom_fa_path = output_prefix + '_gene_2kb_proms.fa'
+    gene_u3_path = output_prefix + '_gene_dummy_u3.fa'
+
+    with open(bed_path, 'w') as bed_out:
+        for (fid, orient), rec in stats.items():
+            if orient != 'sense' or rec.get('total', 0) == 0:
+                continue
+            info = feat_info[fid]
+            if info['class'] != 'Gene':
+                continue
+            chrom = info['chrom']
+            strand = info['strand']
+            if chrom not in contigs or strand not in ('+', '-'):
+                continue
+
+            origins = _pooled_origins(tss_positions, (fid, orient))
+            peak, _, _, _ = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
+            if peak == 'NA':
+                continue
+            tss1 = peak + 1
+            chrom_len = fa.get_reference_length(chrom)
+
+            prom_start0 = max(0, tss1 - 1000)
+            prom_end1 = min(tss1 + 1000, chrom_len)
+            bed_out.write(f"{chrom}\t{prom_start0}\t{prom_end1}\t{fid}\t0\t{strand}\n")
+            promoter_records.append(SeqRecord(
+                _extract_region(fa, chrom, prom_start0 + 1, prom_end1, strand),
+                id=f"{fid}|{chrom}:{prom_start0}-{prom_end1}({strand})", description=""))
+
+            if strand == '+':
+                u3_start0, u3_end1_g = max(0, tss1 - 1000), tss1
+            else:
+                u3_start0, u3_end1_g = tss1, min(tss1 + 1000, chrom_len)
+            gene_u3_records.append(SeqRecord(
+                Seq("NNNNN"), id=f"{fid}|{chrom}:{u3_start0}-{u3_end1_g}({strand})", description=""))
+
+    SeqIO.write(promoter_records, prom_fa_path, 'fasta')
+    print(f"[Gene] Wrote {len(promoter_records)} promoter entries to {bed_path} and {prom_fa_path}")
+    SeqIO.write(gene_u3_records, gene_u3_path, 'fasta')
+    print(f"[Gene] Wrote {len(gene_u3_records)} dummy U3 sequences to {gene_u3_path}")
+    fa.close()
+
+
 def main():
     args = parse_args()
-    clip_out_splice = args.output + "_ltr_3p_softclip_per_read_spliced.tsv"
-    clip_out_nonsplice = args.output + "_ltr_3p_softclip_per_read_nonspliced.tsv"
-    ltr_exon_out = args.output + "_ltr_exon_stats_per_read.tsv"
+
+    clip_out_splice = args.output + "_3p_softclip_per_read_spliced.tsv"
+    clip_out_nonsplice = args.output + "_3p_softclip_per_read_nonspliced.tsv"
+    elem_exon_out = args.output + "_te_exon_stats_per_read.tsv"
     gene_exon_out = args.output + "_gene_exon_stats_per_read.tsv"
-    elem_info, gene_info, full_tree, nested_tree, nested_info, gene_tree = load_elements_and_ranges(args.gff)
-    stats, tss_positions, end_positions, gene_stats, gene_tss = classify_multiple_bams(
-        elem_info, gene_info, full_tree, nested_tree, nested_info, gene_tree,
-        args.bam, args.min_mapq,
-        clip_out_splice,
-        clip_out_nonsplice,
-        ltr_exon_out,
-        gene_exon_out,
-        n_threads=args.threads,
-        trust_st_tag=args.trust_st_tag
-    )
-    densities = compute_tss_density_separate(stats,
-                                         tss_positions,
-                                         elem_info,
-                                         window=10,
-                                         min_reads=6)
-    with open(args.output + '_primary_tss_density.tsv','w') as out:
-        out.write("Feature\tDistance\tCount\n")
-        for fid, twohists in densities.items():
-            hist = twohists['primary']
-            for i, cnt in enumerate(hist):
-                dist = i - 10
-                out.write(f"{fid}\t{dist}\t{cnt}\n")
-    print("Wrote primary TSS densities to", args.output + '_primary_tss_density.tsv')
 
-    # write SECONDARY‐only densities
-    with open(args.output + '_secondary_tss_density.tsv','w') as out:
-        out.write("Feature\tDistance\tCount\n")
-        for fid, twohists in densities.items():
-            hist = twohists['secondary']
-            for i, cnt in enumerate(hist):
-                dist = i - 10
-                out.write(f"{fid}\t{dist}\t{cnt}\n")
-    print("Wrote secondary TSS densities to", args.output + '_secondary_tss_density.tsv')
-    
-    gene_dens = compute_gene_tss_density_separate(gene_stats,
-                                                  gene_tss,
-                                                  gene_info,
-                                                  window=10,
-                                                  min_reads=7)
+    feat_info, body_tree = load_elements_and_ranges(
+        args.gff, args.te_classes, args.gene_gff, args.canonical_exons_only)
 
-    # write PRIMARY gene densities
-    with open(args.output + '_gene_primary_density.tsv','w') as out:
-        out.write("Gene\tDistance\tCount\n")
-        for gid, h in gene_dens.items():
-            hist = h['primary']
-            for i, cnt in enumerate(hist):
-                dist = i - 10
-                out.write(f"{gid}\t{dist}\t{cnt}\n")
-    print("Wrote gene primary densities to", args.output + '_gene_primary_density.tsv')
+    stats, tss_positions, end_positions = classify_multiple_bams(
+        feat_info, body_tree, args.bam, args.min_mapq, args,
+        clip_out_splice=clip_out_splice,
+        clip_out_nonsplice=clip_out_nonsplice,
+        elem_exon_out=elem_exon_out,
+        gene_exon_out=gene_exon_out,
+        n_threads=args.threads)
 
-    # write SECONDARY gene densities
-    with open(args.output + '_gene_secondary_density.tsv','w') as out:
-        out.write("Gene\tDistance\tCount\n")
-        for gid, h in gene_dens.items():
-            hist = h['secondary']
-            for i, cnt in enumerate(hist):
-                dist = i - 10
-                out.write(f"{gid}\t{dist}\t{cnt}\n")
-    print("Wrote gene secondary densities to", args.output + '_gene_secondary_density.tsv')
+    # Isoform tables, split sense/antisense
+    write_isoform_tables(feat_info, body_tree, stats, tss_positions, args.output, args)
 
-    write_tsv(elem_info, stats, args.output)
-    write_isoform_tss_summary(stats, tss_positions, args.tss_out)
-    write_isoform_tss_summary_top_n(stats, tss_positions, end_positions,
-                                    cleave_out_path=args.output + "_10site.ltr_cleavage_summary.tsv",
-                                    tss_out_path=args.output + "_10site.ltr_tss_summary.tsv",
-                                    n=10)
-    write_gene_summary(gene_stats, gene_tss, args.gene_out)
-    write_gene_summary_top_n(gene_stats, gene_tss,
-                             out_path=args.output + "_10site.gene_summary.tsv",
-                             n=10)
+    # TSS and cleavage summaries (Orientation column)
+    write_isoform_tss_summary(feat_info, stats, tss_positions, args.tss_out, args, n=2)
+    write_isoform_tss_summary(feat_info, stats, tss_positions,
+                              args.output + "_10site.tss_summary.tsv", args, n=10)
+    # Single-orientation copies: WindowScrubber keys tss_map on Feature, so it needs exactly one
+    # row per feature. Pair these with the matching _u3_seqs_<orient>.fa / _ltr_seqs_<orient>.fa.
+    for _o in ('sense', 'antisense'):
+        write_isoform_tss_summary(feat_info, stats, tss_positions,
+                                  f"{args.output}_{_o}.tss_summary.tsv", args, n=10,
+                                  orient_filter=_o)
+    write_cleavage_summary(feat_info, stats, end_positions,
+                           args.output + "_10site.cleavage_summary.tsv", args, n=10)
+
+    # Gene summaries (Orientation column)
+    write_gene_summary(feat_info, stats, tss_positions, args.gene_out, args, n=2)
+    write_gene_summary(feat_info, stats, tss_positions,
+                       args.output + "_10site.gene_summary.tsv", args, n=10)
+
+    # TSS densities
+    te_dens = compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=6)
+    write_density(te_dens, args.output + '_primary_tss_density.tsv', 'primary')
+    write_density(te_dens, args.output + '_secondary_tss_density.tsv', 'secondary')
+
+    gene_dens = compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=7,
+                                    klass='Gene')
+    write_density(gene_dens, args.output + '_gene_primary_density.tsv', 'primary', label="Gene")
+    write_density(gene_dens, args.output + '_gene_secondary_density.tsv', 'secondary', label="Gene")
 
     if args.genome_fasta:
-        u3_seq_extraction(args.genome_fasta, elem_info, gene_info,
-                          stats, tss_positions, gene_tss, gene_stats,
-                          args.output)
+        u3_seq_extraction(args.genome_fasta, feat_info, stats, tss_positions, args.output, args)
+
 
 if __name__ == '__main__':
     main()
