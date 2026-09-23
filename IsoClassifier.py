@@ -42,8 +42,22 @@ classification by majority read strand.
 TSS agreement
 -------------
 For each feature and orientation the modal 5' end is taken as the peak, and the fraction of that
-feature's reads falling in the window centred on it is reported. A peak holding at least
---tss-min-frac of the reads is flagged TSS_Called=1. This is reported, never used to discard reads.
+feature's reads falling in the window centred on it is reported. A peak holding at least the
+required fraction of the reads is flagged TSS_Called=1. This is reported, never used to discard
+reads.
+
+Two thresholds exist, because the flag answers two different questions. A feature nested inside
+another one -- a solo LTR sitting in an intron, say -- shares its span with a host that is itself
+transcribed, so a diffuse 5' end cannot be told apart from read-through caught in passing. Only a
+sharp peak proves the insertion initiated its own transcript, and those features are scored with
+--tss-window / --tss-min-frac (3 bp, 50% by default).
+
+An unnested feature has no host to be confused with: any read assigned to it started inside it, so
+demanding 5'-end sharpness measures ONT end precision rather than whether a TSS exists. Genes and
+standalone elements are therefore scored with --tss-window-unnested / --tss-min-frac-unnested,
+which default to a pure report (every feature with reads is called), matching the behaviour of the
+pre-nesting versions of this tool. Set --tss-min-frac-unnested above 0 to reinstate a threshold;
+TSS_Peak_Frac is always written, so the continuous measure is available either way.
 
 Inputs:
     - GFF with TE annotations (EDTA-style) and genes
@@ -70,11 +84,15 @@ Example Usage:
         --gene_out gene_summary.tsv
 """
 import argparse
+import gzip
+import json
 import logging
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, namedtuple
 from multiprocessing import Pool
+import os
+import sys
 import pandas as pd
 import pysam
 import numpy as np
@@ -82,6 +100,10 @@ from intervaltree import IntervalTree
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nested_em  # noqa: E402  (EM resolution of reads whose 5' end sits in >1 feature)
+import tss_consensus  # noqa: E402  (library-balanced consensus TSS)
 
 # ---------------------------------------------------------------------------
 # Feature classes and isoform vocabularies
@@ -150,8 +172,8 @@ def parse_args():
                         action='store_true',
                         help='Use only the Ensembl_canonical transcript when building each gene\'s '
                              'exon union (default: union across all transcripts)')
-    parser.add_argument('--bam', nargs='+', required=True,
-                        help='One or more BAM files')
+    parser.add_argument('--bam', nargs='+', default=None,
+                        help='One or more BAM files (not used with --merge-sheet)')
     parser.add_argument('--te-classes', dest='te_classes', default=DEFAULT_TE_CLASSES,
                         help=f'Comma-separated element classes to classify (default: {DEFAULT_TE_CLASSES})')
     parser.add_argument('--trust-st-tag', dest='trust_st_tag', action='store_true',
@@ -173,11 +195,22 @@ def parse_args():
                         help='Covered fraction below which a spliced read is called spliced rather '
                              'than full_length/spanning (default: 0.5)')
     parser.add_argument('--tss-window', dest='tss_window', type=int, default=3,
-                        help='Width in bp of the TSS agreement window, centred on the modal 5\' end '
-                             '(default: 3, i.e. peak-1..peak+1)')
+                        help='Width in bp of the TSS agreement window, centred on the modal 5\' end, '
+                             'for features nested inside another feature (default: 3, i.e. '
+                             'peak-1..peak+1)')
     parser.add_argument('--tss-min-frac', dest='tss_min_frac', type=float, default=0.5,
-                        help='Fraction of a feature\'s reads that must fall in the TSS window for '
-                             'TSS_Called=1 (default: 0.5). Reported only; never discards reads.')
+                        help='Fraction of a nested feature\'s reads that must fall in the TSS window '
+                             'for TSS_Called=1 (default: 0.5). Reported only; never discards reads.')
+    parser.add_argument('--tss-window-unnested', dest='tss_window_unnested', type=int, default=None,
+                        help='TSS agreement window for features with no nesting parent, where a '
+                             'sharp peak is not needed to establish that transcription began inside '
+                             'the feature (default: same as --tss-window)')
+    parser.add_argument('--tss-min-frac-unnested', dest='tss_min_frac_unnested', type=float,
+                        default=0.0,
+                        help='Fraction of an unnested feature\'s reads that must fall in the TSS '
+                             'window for TSS_Called=1 (default: 0.0, i.e. any feature with reads is '
+                             'called, matching the pre-nesting behaviour). TSS_Peak_Frac is written '
+                             'regardless.')
     parser.add_argument('--progress-every', dest='progress_every', type=int, default=1_000_000,
                         help='Print a progress line every N reads assessed, with an ETA read from '
                              'the BAM indexes (default: 1000000)')
@@ -194,7 +227,114 @@ def parse_args():
     parser.add_argument('--genome-fasta', dest='genome_fasta', default=None,
                         help='Genome FASTA for U3/promoter sequence extraction '
                              '(enables u3_seq_extraction after classification)')
-    return parser.parse_args()
+    parser.add_argument('--assign', choices=('innermost', 'em'), default='innermost',
+                        help='How to attribute a read whose 5\' end lies inside more than one '
+                             'feature. innermost (default): smallest containing feature wins. '
+                             'em: probabilistic assignment across the containing features '
+                             '(nested TEs, TEs in genes); see nested_em.py. Writes '
+                             '<output>_em_reads.tsv and <output>_em_units.tsv.')
+    parser.add_argument('--em-tss-halfwidth', dest='em_tss_halfwidth', type=int, default=8,
+                        help='EM: half-width (bp) of the kernel used to pool 5\' ends into a TSS '
+                             'profile and call TSS peaks (default: 8)')
+    parser.add_argument('--em-tss-trunc-ratio', dest='em_tss_trunc_ratio', type=float, default=20.0,
+                        help='EM: a TSS peak must hold at least this many times the 5\' ends that '
+                             'read-through transcription plus RT drop-off would leave in its '
+                             'window, so an RT stall site inside a transcribed feature is not sold '
+                             'to a unit that merely has the position in its promoter zone '
+                             '(default: 20; 0 disables the test)')
+    parser.add_argument('--em-eps-evidence-k', dest='em_eps_evidence_k', type=float, default=5.0,
+                        help='EM: how much evidence (certain reads + called TSS peaks) a feature '
+                             'needs before it may claim reads that started at a TSS it has no '
+                             'peak for. Higher demands more; 0 restores the flat allowance '
+                             '(default: 5)')
+    parser.add_argument('--em-alpha-prior', dest='em_alpha_prior', type=float, default=0.5,
+                        help='EM: Dirichlet prior on a feature\'s abundance, so reads it has '
+                             'already absorbed do not make it more attractive to the next read '
+                             '(default: 0.5)')
+    parser.add_argument('--em-trunc-min-sample', dest='em_trunc_min_sample', type=int,
+                        default=2000,
+                        help='EM: reads a BAM needs before it gets its own read-length survival '
+                             'curve instead of the pooled one; libraries differing in RT '
+                             'processivity should not share a curve (default: 2000)')
+    parser.add_argument('--em-exclusive-nested-promoters', dest='em_exclusive_nested',
+                        action='store_true',
+                        help='EM: give a nested feature exclusive claim to TSS peaks inside it even '
+                             'when it overlaps the host\'s own promoter (a gene\'s 5\' end, an '
+                             'element\'s LTRs). Off by default: a short annotation sitting on a '
+                             'gene\'s TSS would otherwise take that gene\'s promoter outright')
+    parser.add_argument('--em-antisense-prior', dest='em_antisense_prior', type=float, default=0.25,
+                        help='EM: prior odds that a read arose from antisense transcription rather '
+                             'than sense at the same locus (default 0.25; 1.0 removes the prior). '
+                             'Antisense is real but rarer, and nothing else in the model says so')
+    parser.add_argument('--em-junc-init-frac', dest='em_junc_init_frac', type=float, default=0.5,
+                        help='EM: share of initiation the model must give a read before it may use '
+                             'a feature\'s learned read-out junctions (default 0.5). Lower retains '
+                             'more read-out; higher is stricter about truncated reads')
+    parser.add_argument('--em-readout-bp', dest='em_readout_bp', type=int, default=10_000,
+                        help='EM: length of the read-out region past a unit\'s 3\' end over which '
+                             'read-out 3\' ends are spread (default: 10000)')
+    parser.add_argument('--em-gene-promoter-bp', dest='em_gene_promoter_bp', type=int, default=300,
+                        help='EM: window at a gene\'s annotated 5\' end treated as promoter, in '
+                             'addition to its first exon (default: 300)')
+    parser.add_argument('--em-max-iter', dest='em_max_iter', type=int, default=500)
+    parser.add_argument('--em-tol', dest='em_tol', type=float, default=1e-3,
+                        help='EM: stop when no unit\'s expected read count changes by more than '
+                             'this (default: 0.001)')
+    parser.add_argument('--tss-method', dest='tss_method', choices=('consensus', 'mode'),
+                        default='consensus',
+                        help='consensus (default): library-balanced call -- each library\'s share '
+                             'of the feature\'s 5\' ends within its platform half-width, weighted '
+                             'by n/(n+k); see tss_consensus.py. mode: the original modal 5\' end '
+                             'of all pooled reads, to reproduce earlier results')
+    parser.add_argument('--platform', default='ont',
+                        help='Platform of every --bam not listed in --library-sheet; sets the TSS '
+                             'half-width (ont, pacbio_ccs, pacbio_clr; default: ont)')
+    parser.add_argument('--tss-halfwidths', dest='tss_halfwidths', default=None,
+                        help='Override or add platform half-widths in bp, e.g. '
+                             '"ont=8,pacbio_ccs=3,pacbio_clr=8" (these are the defaults)')
+    parser.add_argument('--tss-lib-k', dest='tss_lib_k', type=float, default=10.0,
+                        help='Library weight n/(n+k) for a feature with n reads in that library; '
+                             'a library with k reads counts half (default: 10)')
+    parser.add_argument('--tss-min-lib-reads', dest='tss_min_lib_reads', type=int, default=5,
+                        help='Reads a library needs for a feature before it counts toward '
+                             'Libraries_Qualifying / Samples_Supporting (default: 5)')
+    parser.add_argument('--tss-evidence', dest='tss_evidence', action='append', default=None,
+                        metavar='NAME=PATH[,PATH]',
+                        help='External TSS evidence (Smar2C2, CAGE, ...), repeatable, highest '
+                             'priority first. The first track with enough support near any read '
+                             'start position picks TSS1 among those positions. Formats by '
+                             'extension: .gff/.gff3 (CAGE clusters, dominant TSS in column 8), '
+                             '.bed, or a TSS table with seq/TSS/strand[/nTAGs] columns '
+                             '(TSRexplorer). Comma-separated paths pool (e.g. shoot,root)')
+    parser.add_argument('--tss-evidence-window', dest='tss_evidence_window', type=int, default=10,
+                        help='Evidence counted within +/- this many bp of a candidate (default 10)')
+    parser.add_argument('--tss-evidence-min', dest='tss_evidence_min', type=float, default=3.0,
+                        help='Summed evidence weight (tags, or CAGE score) a track needs at a '
+                             'candidate before it may choose TSS1 (default 3)')
+    parser.add_argument('--tss-evidence-min-reads', dest='tss_evidence_min_reads', type=int,
+                        default=2,
+                        help='Reads that must start at a position for evidence to make it TSS1 '
+                             '(default 2), so TSS1 stays where these libraries\' reads start')
+    parser.add_argument('--library-sheet', dest='library_sheet', default=None,
+                        help='TSV with Source (BAM path or basename), Library and Platform: '
+                             'BAMs sharing a Library are summed before the TSS call')
+    parser.add_argument('--write-state', dest='write_state', action='store_true',
+                        help='Also write <output>_state_{features,5p,3p}.tsv.gz, the per-sample '
+                             'counts --merge-sheet combines')
+    parser.add_argument('--merge-sheet', dest='merge_sheet', default=None,
+                        help='Merge mode: TSV with Source (a --write-state run\'s --output prefix) '
+                             'and optional Library/Platform overrides. Reads no BAMs; writes every '
+                             'summary a normal run writes, from the summed states')
+    parser.add_argument('--merge-allow-mismatch', dest='merge_allow_mismatch',
+                        action='store_true',
+                        help='Merge states whose annotation or counting arguments differ '
+                             '(warns instead of stopping)')
+    args = parser.parse_args()
+    if bool(args.bam) == bool(args.merge_sheet):
+        parser.error('give exactly one of --bam or --merge-sheet')
+    if args.merge_sheet and args.write_state:
+        parser.error('--write-state applies to BAM runs, not --merge-sheet')
+    return args
 
 
 # Helper function to parse GFF attributes into a dictionary
@@ -262,6 +402,7 @@ def load_gene_exons(gene_gff, canonical_only=False):
         n_canon += 1
 
     per_gene = defaultdict(list)
+    per_tx = defaultdict(list)
     ex_rows = df[df['feature'] == 'exon']
     for s, e, attrs in zip(ex_rows['start'], ex_rows['end'], ex_rows['attrs']):
         a = parse_attributes(attrs)
@@ -273,11 +414,21 @@ def load_gene_exons(gene_gff, canonical_only=False):
         if gid is None:
             continue
         per_gene[gid].append((int(s) - 1, int(e)))
+        per_tx[(gid, tid)].append((int(s) - 1, int(e)))
+
+    # Annotated introns, in the (donor, acceptor) convention of junctions_from_read, used by
+    # --assign em to recognise reads that splice like the gene.
+    gene_introns = defaultdict(set)
+    for (gid, _tid), ivs in per_tx.items():
+        ivs = sorted(ivs)
+        for (_s1, e1), (s2, _e2) in zip(ivs, ivs[1:]):
+            if s2 > e1:
+                gene_introns[gid].add((e1, s2))
 
     gene_exons = {}
     for gid, ivs in per_gene.items():
         merged = _merge_intervals(ivs)
-        gene_exons[gid] = (merged, sum(e - s for s, e in merged))
+        gene_exons[gid] = (merged, sum(e - s for s, e in merged), frozenset(gene_introns[gid]))
 
     print(f"  {len(gene_exons)} genes with exons from {n_canon} transcripts "
           f"({'canonical only' if canonical_only else 'all transcripts'}).")
@@ -325,9 +476,9 @@ def load_elements_and_ranges(gff_path, te_classes, gene_gff=None, canonical_exon
         a = parse_attributes(row.attrs)
 
         if base == 'LTR':
-            method = a.get('Method', '')
+            method = a.get('Method', a.get('method', ''))
             parent = a.get('Parent')
-            if parent and method == 'structural':
+            if parent and method.lower() == 'structural':
                 # Structural elements are keyed on Parent so their long_terminal_repeat
                 # children (which carry the same Parent) resolve to the same record.
                 fid, klass = parent, 'LTR_structural'
@@ -353,6 +504,7 @@ def load_elements_and_ranges(gff_path, te_classes, gene_gff=None, canonical_exon
             'ltr_right': None,
             'exons': None,
             'exon_len': 0,
+            'introns': frozenset(),
         }
         class_counts[klass] += 1
 
@@ -398,7 +550,7 @@ def load_elements_and_ranges(gff_path, te_classes, gene_gff=None, canonical_exon
             ex = gene_exons.get(fid)
             if not ex:
                 continue
-            merged, exlen = ex
+            merged, exlen, introns = ex
             # Sanity check: exons must sit inside the gene span from the main GFF, otherwise the
             # two annotations are on different assemblies and the coverage call would be garbage.
             if merged[0][0] < rec['start'] or merged[-1][1] > rec['end']:
@@ -406,6 +558,7 @@ def load_elements_and_ranges(gff_path, te_classes, gene_gff=None, canonical_exon
                 continue
             rec['exons'] = merged
             rec['exon_len'] = exlen
+            rec['introns'] = introns
             n_hit += 1
         n_genes = class_counts.get('Gene', 0)
         print(f"  Attached exons to {n_hit}/{n_genes} genes"
@@ -805,6 +958,7 @@ def classify_simple(rec, origin, endpos, strand, blocks, has_intron,
 # Globals for worker inheritance (zero-copy on Linux via fork)
 _GLOBAL_FEAT_INFO = {}
 _GLOBAL_BODY_TREE = {}
+_INVOLVED_CACHE = {}
 
 
 def init_worker(feat_info, body_tree):
@@ -814,16 +968,95 @@ def init_worker(feat_info, body_tree):
     _GLOBAL_BODY_TREE = body_tree
 
 
+# A read whose 5' end lies in more than one feature, held back until --assign em has decided
+# where it goes. cands lists every containing feature as (fid, orient, class, category), innermost
+# first, so the read can be accumulated under whichever one wins without touching the BAM again.
+DeferredRead = namedtuple('DeferredRead', [
+    'chrom', 'origin', 'endpos', 'strand', 'juncs', 'has_intron', 'qlen', 'alen', 'cands',
+    'term_fid', 'read_name', 'mapq', 'is_rev', 'clip3', 'ref_start', 'ref_end', 'exon_stats',
+    'sample'])
+
+# A single-candidate read of a feature that overlaps other features. Its assignment is certain,
+# but EM needs it: these reads anchor the unit's abundance, TSS profile and 3'-end behaviour.
+AnchorRead = namedtuple('AnchorRead', [
+    'key', 'origin', 'endpos', 'has_intron', 'juncs', 'alen', 'read_name', 'ref_start',
+    'ref_end', 'sample'])
+
+# Columns appended to every per-read row (same order in both row types).
+ASSIGN_COLS = ["Assign_Method", "Assign_Posterior", "TSS_Init_Prob", "Innermost_Feature",
+               "EM_Candidates"]
+
+
 def _empty_result(chrom):
     return {'chrom': chrom, 'n_reads': 0, 'n_assigned': 0,
             'strand_counts': Counter(), 'stats': {},
-            'tss_positions': {}, 'end_positions': {},
+            'tss_counts': {}, 'end_counts': {},
             'clip_rows_splice': [], 'clip_rows_nonsplice': [],
-            'elem_exon_rows': [], 'gene_exon_rows': []}
+            'elem_exon_rows': [], 'gene_exon_rows': [],
+            'em_deferred': [], 'em_anchor': []}
+
+
+def _ensure_key(stats, tss_counts, end_counts, key):
+    if key not in stats:
+        stats[key] = _new_stat_rec()
+        tss_counts[key] = {}
+        end_counts[key] = {}
+
+
+def _accumulate(stats, tss_counts, end_counts, key, cat, qlen, strand, juncs, origin,
+                endpos, has_intron, sample):
+    """Credit one read from BAM index `sample` to (feature, orientation) under category cat.
+
+    5' and 3' ends are kept as counts rather than one list entry per read: tss_counts[key]
+    is {sample: {cat: Counter(position)}} and end_counts[key] is {cat: Counter(position)}.
+    Categories are kept so the pooled order (category-major) reproduces the original modal ties.
+    """
+    _ensure_key(stats, tss_counts, end_counts, key)
+    srec = stats[key]
+    srec['total'] += 1
+    srec['counts'][cat] += 1
+    srec['lengths'][cat] += qlen
+    srec['strands'][cat].append(strand)
+    srec['junctions'][cat] |= set(juncs)
+    by_cat = tss_counts[key].setdefault(sample, {})
+    c5 = by_cat.get(cat)
+    if c5 is None:
+        c5 = by_cat[cat] = Counter()
+    c5[origin] += 1
+    c3 = end_counts[key].get(cat)
+    if c3 is None:
+        c3 = end_counts[key][cat] = Counter()
+    c3[endpos] += 1
+    if has_intron:
+        srec['spliced'][cat] += 1
+
+
+def _orient_for(rec, strand):
+    if rec['strand_known']:
+        return 'sense' if strand == rec['strand'] else 'antisense'
+    return 'rs+' if strand == '+' else 'rs-'
+
+
+def _category_for(rec, origin, endpos, strand, blocks, has_intron, full_length_frac,
+                  spliced_cov_frac):
+    if rec['class'] == 'LTR_structural':
+        return classify_ltr(rec, origin, endpos, strand, blocks, has_intron, spliced_cov_frac)
+    return classify_simple(rec, origin, endpos, strand, blocks, has_intron,
+                           full_length_frac, spliced_cov_frac)
+
+
+def _involved(fid, rec, tree_chrom):
+    """True if this feature overlaps any other feature (so its reads can matter to EM)."""
+    hit = _INVOLVED_CACHE.get(fid)
+    if hit is None:
+        hit = len(tree_chrom.overlap(rec['start'], rec['end'])) > 1
+        _INVOLVED_CACHE[fid] = hit
+    return hit
 
 
 def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_paths, min_mapq,
-                    trust_st_tag, min_intron_len, full_length_frac, spliced_cov_frac):
+                    trust_st_tag, min_intron_len, full_length_frac, spliced_cov_frac,
+                    assign_mode='innermost'):
     """Process primary reads whose alignment starts in [claim_start, claim_end) on *chrom*.
 
     Reads are fetched from [fetch_start, fetch_end) (which may extend past the claim bounds by the
@@ -831,6 +1064,10 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
     reference_start inside [claim_start, claim_end) are counted -- that is the deduplication rule
     across adjacent chunks. Annotation lookups use the whole-chromosome tree, so a read is never
     truncated by chunk boundaries.
+
+    With assign_mode='em', a read whose 5' end lies inside more than one feature is not credited
+    here; it is returned as a DeferredRead and assigned after EM has seen every read. Reads of
+    features that overlap other features are also returned as AnchorReads (and credited as usual).
     """
     feat_info = _GLOBAL_FEAT_INFO
     body_tree_chrom = _GLOBAL_BODY_TREE.get(chrom, None)
@@ -838,31 +1075,23 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
     if not body_tree_chrom:
         return _empty_result(chrom)
 
+    em = assign_mode == 'em'
     n_reads = 0
     n_assigned = 0
     strand_counts = Counter()
 
     stats = {}            # (fid, orient) -> per-feature stats
-    tss_positions = {}    # (fid, orient) -> {cat: [int, ...]}
-    end_positions = {}    # (fid, orient) -> {cat: [int, ...]}
+    tss_counts = {}       # (fid, orient) -> {sample: {cat: Counter(position)}}
+    end_counts = {}       # (fid, orient) -> {cat: Counter(position)}
 
     clip_rows_splice = []
     clip_rows_nonsplice = []
     elem_exon_rows = []
     gene_exon_rows = []
+    em_deferred = []
+    em_anchor = []
 
-    def _ensure(key):
-        if key not in stats:
-            stats[key] = {'total': 0,
-                          'counts': {c: 0 for c in ALL_CATS},
-                          'lengths': {c: 0 for c in ALL_CATS},
-                          'spliced': {c: 0 for c in ALL_CATS},
-                          'junctions': {c: set() for c in ALL_CATS},
-                          'strands': {c: [] for c in ALL_CATS}}
-            tss_positions[key] = {c: [] for c in ALL_CATS}
-            end_positions[key] = {c: [] for c in ALL_CATS}
-
-    for path in bam_paths:
+    for sample, path in enumerate(bam_paths):
         bf = pysam.AlignmentFile(path, 'rb')
         try:
             read_iter = bf.fetch(contig=chrom, start=fetch_start, end=fetch_end)
@@ -874,9 +1103,7 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             rs = read.reference_start
             if rs is None or rs < claim_start or rs >= claim_end:
                 continue
-
             n_reads += 1
-
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
             if read.mapping_quality < min_mapq:
@@ -897,28 +1124,21 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             rec = feat_info.get(winner)
             if rec is None:
                 continue
-
             klass = rec['class']
 
             # Orientation. Features with a known strand are labelled directly. Features annotated
             # '.' or '?' are bucketed by read strand and resolved to sense/antisense after the
-            # run, by majority read support -- the old code voted on strand but applied the result
-            # only after classification had already finished, so the vote never took effect.
-            if rec['strand_known']:
-                orient = 'sense' if strand == rec['strand'] else 'antisense'
-            else:
-                orient = 'rs+' if strand == '+' else 'rs-'
+            # run, by majority read support.
+            orient = _orient_for(rec, strand)
 
             blocks = read.get_blocks()
             juncs = junctions_from_read(read, min_intron_len)
             has_intron = bool(juncs)
+            qlen = read.query_length or read.infer_query_length() or 0
+            alen = sum(e - s for s, e in blocks)    # aligned reference bases, introns excluded
 
-            if klass == 'LTR_structural':
-                cat = classify_ltr(rec, origin, endpos, strand, blocks, has_intron,
-                                   spliced_cov_frac)
-            else:
-                cat = classify_simple(rec, origin, endpos, strand, blocks, has_intron,
-                                      full_length_frac, spliced_cov_frac)
+            cat = _category_for(rec, origin, endpos, strand, blocks, has_intron,
+                                full_length_frac, spliced_cov_frac)
             if not cat:
                 continue
 
@@ -926,38 +1146,58 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
             # transcript that starts in a gene and terminates inside a nested TE (or starts in a
             # TE and runs out through a gene) be picked out for chimerism follow-up.
             term_fid, _ = innermost_at(body_tree_chrom, endpos)
-            terminates_in = term_fid if (term_fid and term_fid != winner) else ''
 
-            key = (winner, orient)
-            _ensure(key)
-            srec = stats[key]
-            srec['total'] += 1
-            srec['counts'][cat] += 1
-            srec['lengths'][cat] += (read.query_length or read.infer_query_length() or 0)
-            srec['strands'][cat].append(strand)
-            srec['junctions'][cat] |= juncs
-            tss_positions[key][cat].append(origin)
-            end_positions[key][cat].append(endpos)
-            if has_intron:
-                srec['spliced'][cat] += 1
-            n_assigned += 1
-
-            nested_in = ";".join(others) if others else ""
             clip3S = softclip_3prime(read)
-
-            n_ex, n_in, ex_total, in_total, fields, saw_real = exon_intron_row_fields(
+            exon_stats = exon_intron_row_fields(
                 read, min_intron_len=min_intron_len, max_exons=5, length_mode="query")
 
+            if em and others:
+                # Every containing feature is a candidate origin; categorise the read against each
+                # now so the winner can be credited later without re-reading the BAM.
+                cands = [(winner, orient, klass, cat)]
+                for fid in others:
+                    orec = feat_info.get(fid)
+                    if orec is None:
+                        continue
+                    ocat = _category_for(orec, origin, endpos, strand, blocks, has_intron,
+                                         full_length_frac, spliced_cov_frac)
+                    if ocat:
+                        cands.append((fid, _orient_for(orec, strand), orec['class'], ocat))
+                if len(cands) > 1:
+                    em_deferred.append(DeferredRead(
+                        chrom, origin, endpos, strand, tuple(sorted(juncs)), has_intron, qlen,
+                        alen, tuple(cands), term_fid or '', read.query_name, read.mapping_quality,
+                        int(read.is_reverse), clip3S, read.reference_start, read.reference_end,
+                        exon_stats, sample))
+                    n_assigned += 1
+                    continue
+
+            terminates_in = term_fid if (term_fid and term_fid != winner) else ''
+            key = (winner, orient)
+            _accumulate(stats, tss_counts, end_counts, key, cat, qlen, strand, juncs,
+                        origin, endpos, has_intron, sample)
+            n_assigned += 1
+
+            if em and _involved(winner, rec, body_tree_chrom):
+                em_anchor.append(AnchorRead(key, origin, endpos, has_intron, tuple(sorted(juncs)),
+                                            alen, read.query_name, read.reference_start,
+                                            read.reference_end, sample))
+
+            nested_in = ";".join(others) if others else ""
+            method = 'innermost' if others else 'unique'
+            assign_fields = (method, '1' if not others else 'NA', 'NA', winner, '')
+
+            n_ex, n_in, ex_total, in_total, fields, saw_real = exon_stats
             row = (winner, klass, orient, chrom, origin, cat,
                    read.query_name, read.mapping_quality, int(read.is_reverse),
                    clip3S, read.reference_start, read.reference_end,
-                   nested_in, terminates_in)
+                   nested_in, terminates_in) + assign_fields
             if saw_real:
                 clip_rows_splice.append(row)
                 exon_row = (winner, klass, orient, chrom, origin, cat,
                             read.query_name, read.mapping_quality, int(read.is_reverse),
                             n_ex, n_in, ex_total, in_total, *fields,
-                            nested_in, terminates_in)
+                            nested_in, terminates_in) + assign_fields
                 if klass == 'Gene':
                     gene_exon_rows.append(exon_row)
                 else:
@@ -973,13 +1213,194 @@ def _classify_chunk(chrom, claim_start, claim_end, fetch_start, fetch_end, bam_p
         'n_assigned': n_assigned,
         'strand_counts': strand_counts,
         'stats': stats,
-        'tss_positions': tss_positions,
-        'end_positions': end_positions,
+        'tss_counts': tss_counts,
+        'end_counts': end_counts,
         'clip_rows_splice': clip_rows_splice,
         'clip_rows_nonsplice': clip_rows_nonsplice,
         'elem_exon_rows': elem_exon_rows,
         'gene_exon_rows': gene_exon_rows,
+        'em_deferred': em_deferred,
+        'em_anchor': em_anchor,
     }
+
+
+# ---------------------------------------------------------------------------
+# EM resolution of reads whose 5' end lies inside more than one feature
+# ---------------------------------------------------------------------------
+
+def _children_spans(fid, feat_info, body_tree):
+    """Spans of features strictly nested inside fid (removed from its promoter zone)."""
+    rec = feat_info[fid]
+    tree = body_tree.get(rec['chrom'])
+    out = []
+    if tree is None:
+        return out
+    span = rec['end'] - rec['start']
+    for iv in tree.overlap(rec['start'], rec['end']):
+        if iv.data[0] == fid:
+            continue
+        if iv.begin >= rec['start'] and iv.end <= rec['end'] and (iv.end - iv.begin) < span:
+            out.append((iv.begin, iv.end))
+    return out
+
+
+def em_assign_deferred(feat_info, body_tree, deferred, anchors, stats, tss_counts,
+                       end_counts, rows, args, n_threads=1):
+    """
+    Fit the nested-read EM, credit every deferred read to its maximum-posterior unit, and write
+    <output>_em_reads.tsv and <output>_em_units.tsv.
+
+    rows: dict with the four per-read row lists; deferred reads' rows are appended to them and
+    anchor reads' rows get their TSS_Init_Prob filled in.
+    """
+    if not deferred:
+        print("EM: no read had its 5' end inside more than one feature; nothing to resolve.")
+        return
+    # Only units that are candidates for some contested read enter EM; anchors of every other
+    # unit (overlapping features that never shared a 5' end) are dropped here.
+    contested = {(fid, orient) for d in deferred for fid, orient, _k, _c in d.cands}
+    n_anchor = len(anchors)
+    anchors = [a for a in anchors if a.key in contested]
+    print(f"EM: {len(contested):,} contested units; kept {len(anchors):,} of {n_anchor:,} "
+          f"anchor reads.")
+    p = nested_em.EMParams(tss_halfwidth=args.em_tss_halfwidth,
+                           tss_trunc_ratio=args.em_tss_trunc_ratio,
+                           eps_evidence_k=args.em_eps_evidence_k,
+                           alpha_prior=args.em_alpha_prior,
+                           trunc_min_sample=args.em_trunc_min_sample,
+                           share_promoter_peaks=not args.em_exclusive_nested,
+                           antisense_prior=args.em_antisense_prior,
+                           junc_init_frac=args.em_junc_init_frac,
+                           readout_bp=args.em_readout_bp,
+                           gene_promoter_bp=args.em_gene_promoter_bp,
+                           junc_tol=5, max_iter=args.em_max_iter, tol=args.em_tol)
+
+    records = [(d.origin, d.endpos, d.has_intron, d.juncs,
+                tuple((fid, orient) for fid, orient, _k, _c in d.cands), d.alen, d.sample)
+               for d in deferred]
+    records += [(a.origin, a.endpos, a.has_intron, a.juncs, (a.key,), a.alen, a.sample)
+                for a in anchors]
+
+    child_cache = {}
+
+    def builder(key):
+        fid = key[0]
+        if fid not in child_cache:
+            child_cache[fid] = _children_spans(fid, feat_info, body_tree)
+        rec = feat_info[fid]
+        return nested_em.build_unit(key, rec, child_cache[fid], rec.get('introns'), p)
+
+    t0 = time.time()
+    if n_threads > 1:
+        with Pool(processes=n_threads) as pool:
+            post, summary, cluster_of, trunc = nested_em.resolve(records, builder, p, pool=pool)
+    else:
+        post, summary, cluster_of, trunc = nested_em.resolve(records, builder, p)
+    n_clusters = len({c for c in cluster_of if c is not None})
+    print(f"EM: resolved {len(deferred):,} multi-candidate reads over {len(summary):,} units in "
+          f"{n_clusters:,} clusters ({time.time() - t0:.1f} s).")
+
+    # ---- credit deferred reads to their maximum-posterior unit ----
+    map_counts = Counter()
+    innermost_counts = Counter()
+    em_read_rows = []
+    for d, res in zip(deferred, post[:len(deferred)]):
+        cand_info = {(fid, orient): (klass, cat) for fid, orient, klass, cat in d.cands}
+        best_key, best_g, best_gi = max(res, key=lambda t: t[1])
+        fid, orient = best_key
+        klass, cat = cand_info[best_key]
+        _accumulate(stats, tss_counts, end_counts, best_key, cat, d.qlen, d.strand,
+                    d.juncs, d.origin, d.endpos, d.has_intron, d.sample)
+        map_counts[best_key] += 1
+        innermost_counts[(d.cands[0][0], d.cands[0][1])] += 1
+
+        w = feat_info[fid]
+        parents = [c for c, _o, _k, _c in d.cands if c != fid
+                   and feat_info[c]['start'] <= w['start'] and feat_info[c]['end'] >= w['end']]
+        nested_in = ";".join(parents)
+        terminates_in = d.term_fid if (d.term_fid and d.term_fid != fid) else ''
+        init_prob = best_gi / best_g if best_g > 0 else 0.0
+        cand_str = ";".join(f"{k[0]}|{k[1]}|{g:.4f}" for k, g, _gi in sorted(res, key=lambda t: -t[1]))
+        assign_fields = ('em', f"{best_g:.4f}", f"{init_prob:.4f}", d.cands[0][0], cand_str)
+
+        n_ex, n_in, ex_total, in_total, fields, saw_real = d.exon_stats
+        row = (fid, klass, orient, d.chrom, d.origin, cat, d.read_name, d.mapq, d.is_rev,
+               d.clip3, d.ref_start, d.ref_end, nested_in, terminates_in) + assign_fields
+        if saw_real:
+            rows['clip_splice'].append(row)
+            exon_row = (fid, klass, orient, d.chrom, d.origin, cat, d.read_name, d.mapq,
+                        d.is_rev, n_ex, n_in, ex_total, in_total, *fields,
+                        nested_in, terminates_in) + assign_fields
+            (rows['gene_exon'] if klass == 'Gene' else rows['elem_exon']).append(exon_row)
+        else:
+            rows['clip_nonsplice'].append(row)
+
+        em_read_rows.append((d.read_name, d.chrom, d.origin, d.endpos, d.strand,
+                             d.cands[0][0], d.cands[0][1], fid, orient, cat,
+                             f"{best_g:.4f}", f"{init_prob:.4f}", cand_str))
+
+    # ---- TSS-initiation probability for anchor reads (their unit is certain) ----
+    init_by_read = {}
+    for a, res in zip(anchors, post[len(deferred):]):
+        if res:
+            _key, g, gi = res[0]
+            init_by_read[(a.read_name, a.ref_start, a.ref_end)] = f"{gi / g:.4f}" if g else "NA"
+    if init_by_read:
+        for name in ('clip_splice', 'clip_nonsplice'):
+            lst = rows[name]
+            for i, r in enumerate(lst):
+                v = init_by_read.get((r[6], r[10], r[11]))
+                if v is not None:
+                    lst[i] = r[:-3] + (v,) + r[-2:]
+
+    # ---- per-read and per-unit EM tables ----
+    reads_path = f"{args.output}_em_reads.tsv"
+    with open(reads_path, 'w') as out:
+        out.write("\t".join(["Read", "Chrom", "TSS", "End", "Read_Strand", "Innermost_Feature",
+                             "Innermost_Orientation", "Assigned_Feature", "Assigned_Orientation",
+                             "Category", "Posterior", "TSS_Init_Prob", "Candidates"]) + "\n")
+        for r in em_read_rows:
+            out.write("\t".join(map(str, r)) + "\n")
+    print(f"EM: wrote {len(em_read_rows):,} read assignments to {reads_path}")
+
+    units_path = f"{args.output}_em_units.tsv"
+    cols = ['EM_Reads', 'EM_TSS_Reads', 'TSS_Peaks_In_Zone', 'Full_Length_Frac', 'EM_TSS_Peak',
+            'EM_TSS_Peak_Frac', 'Promoter_Anchor', 'TSS_Offset',
+            'EM_End_Peak', 'EM_End_Peak_Frac', 'Term_Frac', 'Body_End_Frac',
+            'Readout_Frac', 'Spliced_Frac', 'Intronic_5p_Frac',
+            'Cluster', 'Cluster_Units', 'Iterations']
+    with open(units_path, 'w') as out:
+        out.write("\t".join(["Feature", "Orientation", "Class", "Chrom", "Start", "End",
+                             "Unique_Reads", "Innermost_Reads", "MAP_Reads"] + cols) + "\n")
+        for key in sorted(summary, key=lambda k: -summary[k]['EM_Reads']):
+            s = summary[key]
+            rec = feat_info[key[0]]
+            vals = [key[0], key[1], rec['class'], rec['chrom'], rec['start'], rec['end'],
+                    s['Unique_Reads'], s['Unique_Reads'] + innermost_counts.get(key, 0),
+                    s['Unique_Reads'] + map_counts.get(key, 0)]
+            for c in cols:
+                v = s[c]
+                vals.append(f"{v:.4f}" if isinstance(v, float) else v)
+            out.write("\t".join(map(str, vals)) + "\n")
+    print(f"EM: wrote {len(summary):,} unit summaries to {units_path}")
+
+    surv_path = f"{args.output}_em_read_survival.tsv"
+    with open(surv_path, 'w') as out:
+        # One curve per BAM only when more than one was fitted, so a single-BAM run writes exactly
+        # the table it always did.
+        if trunc.by_sample:
+            out.write("Sample\tLength_From\tLength_To\tSurvival_At_Start\tHazard\n")
+            for sid in sorted(trunc.by_sample):
+                name = os.path.basename(args.bam[sid]) if sid < len(args.bam) else str(sid)
+                for lo, hi, S0, h in trunc.by_sample[sid].table():
+                    out.write(f"{name}\t{lo:.0f}\t{hi:.0f}\t{S0:.5f}\t{h:.5f}\n")
+            for lo, hi, S0, h in trunc.table():
+                out.write(f"pooled\t{lo:.0f}\t{hi:.0f}\t{S0:.5f}\t{h:.5f}\n")
+        else:
+            out.write("Length_From\tLength_To\tSurvival_At_Start\tHazard\n")
+            for lo, hi, S0, h in trunc.table():
+                out.write(f"{lo:.0f}\t{hi:.0f}\t{S0:.5f}\t{h:.5f}\n")
+    print(f"EM: wrote library read-length survival curve to {surv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1029,24 +1450,6 @@ def _new_stat_rec():
             'strands': {c: [] for c in ALL_CATS}}
 
 
-def compute_tss_peak(origins, window, min_frac):
-    """
-    Modal 5' end for a feature, and how much of its read support sits on that peak.
-
-    The window is centred on the peak, so the default width of 3 covers peak-1..peak+1. Reported
-    only -- TSS_Called never gates which reads are counted.
-    """
-    if not origins:
-        return ('NA', 0, 0.0, 0)
-    ctr = Counter(origins)
-    total = len(origins)
-    peak, _ = ctr.most_common(1)[0]
-    half = max(0, (window - 1) // 2)
-    cnt = sum(v for pos, v in ctr.items() if abs(pos - peak) <= half)
-    frac = cnt / total
-    return (peak, cnt, frac, int(frac >= min_frac))
-
-
 def nesting_parents(fid, feat_info, body_tree):
     """Features whose span strictly contains this one, using the same rank tiebreak as assignment."""
     rec = feat_info[fid]
@@ -1065,6 +1468,95 @@ def nesting_parents(fid, feat_info, body_tree):
             if ospan > span or (ospan == span and orank < rank):
                 out.append(other)
     return sorted(out)
+
+
+def build_parent_cache(feat_info, body_tree, stats):
+    """
+    Nesting parents for every feature that received reads, resolved once.
+
+    The isoform table needs these for its Nested_In columns and every TSS writer needs them to pick
+    its thresholds, so they are computed here rather than three times over.
+    """
+    cache = {}
+    for fid, _orient in stats:
+        if fid not in cache:
+            cache[fid] = nesting_parents(fid, feat_info, body_tree)
+    return cache
+
+
+def tss_params(fid, parent_cache, args):
+    """
+    TSS agreement window and minimum fraction for one feature.
+
+    The tight window exists to show that a nested insertion initiated its own transcript rather
+    than catching read-through from the feature it sits inside. That ambiguity only exists when the
+    feature has a host, so unnested features -- genes and standalone elements -- get the loose
+    thresholds instead.
+    """
+    if parent_cache.get(fid):
+        return args.tss_window, args.tss_min_frac
+    window = args.tss_window_unnested
+    if window is None:
+        window = args.tss_window
+    return window, args.tss_min_frac_unnested
+
+
+def _merge_cat_counts(dst, src):
+    """{cat: Counter} += {cat: Counter}, keeping first-seen position order within each category."""
+    for c, cnt in src.items():
+        d = dst.get(c)
+        if d is None:
+            dst[c] = Counter(cnt)
+        else:
+            d.update(cnt)
+
+
+def _merge_tss(dst, src):
+    """{sample: {cat: Counter}} += the same."""
+    for sample, by_cat in src.items():
+        _merge_cat_counts(dst.setdefault(sample, {}), by_cat)
+
+
+def resolve_unknown_strands(feat_info, stats, tss_counts, end_counts):
+    """
+    Resolve orientation for features annotated with an unknown strand. Reads were bucketed by
+    their own strand; the better-supported bucket defines the element strand, and therefore which
+    bucket is sense. Returns the number of features resolved.
+    """
+    unknown = defaultdict(dict)
+    for (fid, orient) in list(stats):
+        if orient in ('rs+', 'rs-'):
+            unknown[fid][orient] = stats[(fid, orient)]['total']
+
+    n_inferred = 0
+    for fid, buckets in unknown.items():
+        plus = buckets.get('rs+', 0)
+        minus = buckets.get('rs-', 0)
+        inferred = '+' if plus >= minus else '-'
+        feat_info[fid]['strand'] = inferred
+        feat_info[fid]['strand_source'] = 'inferred'
+        sense_key = 'rs+' if inferred == '+' else 'rs-'
+        for orient in ('rs+', 'rs-'):
+            old = (fid, orient)
+            if old not in stats:
+                continue
+            new = (fid, 'sense' if orient == sense_key else 'antisense')
+            stats[new] = stats.pop(old)
+            tss_counts[new] = tss_counts.pop(old)
+            end_counts[new] = end_counts.pop(old)
+        n_inferred += 1
+    return n_inferred
+
+
+def report_features(feat_info, stats, n_inferred):
+    print(f"Features with reads: {len({f for f, _ in stats})} "
+          f"({n_inferred} had their strand inferred from read support)")
+    obs = Counter(feat_info[f]['class'] for f in {f for f, _ in stats})
+    print("  by class: " + ", ".join(f"{k}={v}" for k, v in sorted(obs.items())))
+    orient_totals = Counter()
+    for (fid, orient), rec in stats.items():
+        orient_totals[orient] += rec['total']
+    print(f"  reads by orientation: {dict(orient_totals)}")
 
 
 def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
@@ -1091,7 +1583,8 @@ def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
             chunks.append((chrom, claim_start, claim_end,
                            max(0, claim_start - overlap), min(length, claim_end + overlap),
                            bam_paths, min_mapq, args.trust_st_tag, args.min_intron_len,
-                           args.full_length_frac, args.spliced_cov_frac))
+                           args.full_length_frac, args.spliced_cov_frac,
+                           getattr(args, 'assign', 'innermost')))
             pos = claim_end
 
     print(f"Dispatching {len(chunks)} chunks ({chunk_size // 1000} kb each, "
@@ -1141,12 +1634,14 @@ def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
     # ~1.1M features the full TE annotation brings in.
     strand_counts = Counter()
     stats = {}
-    tss_positions = {}
-    end_positions = {}
+    tss_counts = {}
+    end_counts = {}
     clip_rows_splice = []
     clip_rows_nonsplice = []
     elem_exon_rows = []
     gene_exon_rows = []
+    em_deferred = []
+    em_anchor = []
 
     for res in results:
         strand_counts += res['strand_counts']
@@ -1155,8 +1650,8 @@ def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
             s = stats.get(key)
             if s is None:
                 s = stats[key] = _new_stat_rec()
-                tss_positions[key] = {c: [] for c in ALL_CATS}
-                end_positions[key] = {c: [] for c in ALL_CATS}
+                tss_counts[key] = {}
+                end_counts[key] = {}
             s['total'] += r['total']
             for c in ALL_CATS:
                 if r['counts'][c]:
@@ -1167,68 +1662,47 @@ def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
                 if r['junctions'][c]:
                     s['junctions'][c] |= r['junctions'][c]
 
-        for key, pos_dict in res['tss_positions'].items():
-            dst = tss_positions[key]
-            for c, lst in pos_dict.items():
-                if lst:
-                    dst[c].extend(lst)
-        for key, pos_dict in res['end_positions'].items():
-            dst = end_positions[key]
-            for c, lst in pos_dict.items():
-                if lst:
-                    dst[c].extend(lst)
+        for key, by_sample in res['tss_counts'].items():
+            _merge_tss(tss_counts[key], by_sample)
+        for key, by_cat in res['end_counts'].items():
+            _merge_cat_counts(end_counts[key], by_cat)
 
         clip_rows_splice.extend(res['clip_rows_splice'])
         clip_rows_nonsplice.extend(res['clip_rows_nonsplice'])
         elem_exon_rows.extend(res['elem_exon_rows'])
         gene_exon_rows.extend(res['gene_exon_rows'])
+        em_deferred.extend(res.get('em_deferred', ()))
+        em_anchor.extend(res.get('em_anchor', ()))
 
-    # Resolve orientation for features annotated with an unknown strand. Reads were bucketed by
-    # their own strand; the better-supported bucket defines the element strand, and therefore
-    # which bucket is sense.
-    unknown = defaultdict(dict)
-    for (fid, orient) in list(stats):
-        if orient in ('rs+', 'rs-'):
-            unknown[fid][orient] = stats[(fid, orient)]['total']
+    # Multi-candidate reads (--assign em) are credited here, before unknown-strand resolution, so
+    # their rs+/rs- buckets are relabelled together with everything else.
+    if getattr(args, 'assign', 'innermost') == 'em':
+        rows = {'clip_splice': clip_rows_splice, 'clip_nonsplice': clip_rows_nonsplice,
+                'elem_exon': elem_exon_rows, 'gene_exon': gene_exon_rows}
+        em_assign_deferred(feat_info, body_tree, em_deferred, em_anchor, stats, tss_counts,
+                           end_counts, rows, args, n_threads=n_threads)
+        del em_deferred[:], em_anchor[:]
 
-    n_inferred = 0
-    for fid, buckets in unknown.items():
-        plus = buckets.get('rs+', 0)
-        minus = buckets.get('rs-', 0)
-        inferred = '+' if plus >= minus else '-'
-        feat_info[fid]['strand'] = inferred
-        feat_info[fid]['strand_source'] = 'inferred'
-        sense_key = 'rs+' if inferred == '+' else 'rs-'
-        for orient in ('rs+', 'rs-'):
-            old = (fid, orient)
-            if old not in stats:
-                continue
-            new = (fid, 'sense' if orient == sense_key else 'antisense')
-            stats[new] = stats.pop(old)
-            tss_positions[new] = tss_positions.pop(old)
-            end_positions[new] = end_positions.pop(old)
-        n_inferred += 1
+    # State for --merge-sheet, taken before unknown-strand resolution so a merge can resolve
+    # strands on the summed support of every library instead of inheriting one sample's call.
+    if getattr(args, 'write_state', False):
+        write_state(args.output, stats, tss_counts, end_counts, args)
+
+    n_inferred = resolve_unknown_strands(feat_info, stats, tss_counts, end_counts)
 
     print(f"Classification complete in {(time.time() - start_time) / 60:.1f} minutes.")
     print(f"Strand counts across all reads: {dict(strand_counts)}")
-    print(f"Features with reads: {len({f for f, _ in stats})} "
-          f"({n_inferred} had their strand inferred from read support)")
-    obs = Counter(feat_info[f]['class'] for f in {f for f, _ in stats})
-    print("  by class: " + ", ".join(f"{k}={v}" for k, v in sorted(obs.items())))
-    orient_totals = Counter()
-    for (fid, orient), rec in stats.items():
-        orient_totals[orient] += rec['total']
-    print(f"  reads by orientation: {dict(orient_totals)}")
+    report_features(feat_info, stats, n_inferred)
 
     # ---- per-read outputs ----
     read_hdr = ["Feature", "Class", "Orientation", "Chrom", "TSS", "Category",
                 "Read", "MAPQ", "Aln_Reverse", "softclip_3p", "aln_start", "aln_end",
-                "Nested_In", "Terminates_In"]
+                "Nested_In", "Terminates_In"] + ASSIGN_COLS
     exon_hdr = ["Feature", "Class", "Orientation", "Chrom", "TSS", "Category",
                 "Read", "MAPQ", "Aln_Reverse",
                 "exon_count", "intron_count", "exon_len_combined", "intron_len_combined",
                 "exon1", "intron1", "exon2", "intron2", "exon3", "intron3",
-                "exon4", "intron4", "exon5", "Nested_In", "Terminates_In"]
+                "exon4", "intron4", "exon5", "Nested_In", "Terminates_In"] + ASSIGN_COLS
 
     for path, rows, hdr, label in (
             (clip_out_splice, clip_rows_splice, read_hdr, "spliced reads"),
@@ -1243,7 +1717,326 @@ def classify_multiple_bams(feat_info, body_tree, bam_paths, min_mapq, args,
                 out.write("\t".join(map(str, row)) + "\n")
         print(f"Wrote {len(rows)} {label} records to {path}")
 
-    return stats, tss_positions, end_positions
+    return stats, tss_counts, end_counts
+
+
+# ---------------------------------------------------------------------------
+# Libraries, per-sample state files, and the merge that combines them
+# ---------------------------------------------------------------------------
+
+STATE_VERSION = 1
+
+# Arguments that change which reads a feature receives. Per-sample runs being merged must agree on
+# these, or their counts are not the same quantity.
+_STATE_ARGS = ('te_classes', 'canonical_exons_only', 'assign', 'min_mapq', 'full_length_frac',
+               'spliced_cov_frac', 'min_intron_len', 'trust_st_tag')
+
+
+def _read_sheet(path):
+    """Library/merge sheet: TSV with a Source column and optional Library and Platform columns."""
+    rows = []
+    with open(path) as fh:
+        header = None
+        for line in fh:
+            line = line.rstrip('\n')
+            if not line.strip() or line.startswith('#'):
+                continue
+            fields = line.split('\t')
+            if header is None:
+                header = [h.strip() for h in fields]
+                if 'Source' not in header:
+                    sys.exit(f"{path}: needs a Source column (plus optional Library, Platform)")
+                continue
+            row = dict(zip(header, (f.strip() for f in fields)))
+            rows.append({'Source': row.get('Source', ''), 'Library': row.get('Library', ''),
+                         'Platform': row.get('Platform', '')})
+    return rows
+
+
+def _default_library(path):
+    name = os.path.basename(path)
+    return name[:-4] if name.endswith('.bam') else name
+
+
+def resolve_libraries(bam_paths, args):
+    """(library, platform) for each BAM, from --library-sheet where listed, else one per BAM."""
+    sheet = {}
+    if args.library_sheet:
+        for row in _read_sheet(args.library_sheet):
+            sheet[row['Source']] = row
+            sheet.setdefault(os.path.basename(row['Source']), row)
+    out = []
+    for path in bam_paths:
+        row = sheet.get(path) or sheet.get(os.path.basename(path)) or {}
+        out.append((row.get('Library') or _default_library(path),
+                    row.get('Platform') or args.platform))
+    return out
+
+
+def _file_sig(path):
+    if not path:
+        return None
+    return {'name': os.path.basename(path), 'size': os.path.getsize(path)}
+
+
+def _state_header(args):
+    keys = list(_STATE_ARGS)
+    if args.assign == 'em':
+        keys += sorted(k for k in vars(args) if k.startswith('em_'))
+    return {'state_version': STATE_VERSION,
+            'gff': _file_sig(args.gff), 'gene_gff': _file_sig(args.gene_gff),
+            'args': {k: getattr(args, k) for k in keys},
+            'samples': [{'bam': b, 'library': lib, 'platform': plat}
+                        for b, (lib, plat) in zip(args.bam, args.libraries)]}
+
+
+def _state_paths(prefix):
+    return (f"{prefix}_state_features.tsv.gz", f"{prefix}_state_5p.tsv.gz",
+            f"{prefix}_state_3p.tsv.gz")
+
+
+def write_state(prefix, stats, tss_counts, end_counts, args):
+    """
+    Three gzipped TSVs holding everything the summary writers read, so separate runs can be merged
+    without their BAMs. Orientations are written before unknown-strand resolution (rs+/rs-).
+    """
+    header = '#' + json.dumps(_state_header(args), sort_keys=True) + '\n'
+    f_feat, f_5p, f_3p = _state_paths(prefix)
+    with gzip.open(f_feat, 'wt', compresslevel=5) as out:
+        out.write(header)
+        out.write("Feature\tOrientation\tCategory\tReads\tSum_Len\tSpliced\tJunctions\n")
+        for (fid, orient), rec in stats.items():
+            for c in ALL_CATS:
+                n = rec['counts'][c]
+                if not n:
+                    continue
+                j = ";".join(f"{a}-{b}" for a, b in sorted(rec['junctions'][c])) or '.'
+                out.write(f"{fid}\t{orient}\t{c}\t{n}\t{rec['lengths'][c]}\t"
+                          f"{rec['spliced'][c]}\t{j}\n")
+    with gzip.open(f_5p, 'wt', compresslevel=5) as out:
+        out.write(header)
+        out.write("Feature\tOrientation\tSample\tCategory\tTSS\tCount\n")
+        for (fid, orient) in stats:
+            for sample in sorted(tss_counts[(fid, orient)]):
+                for c, cnt in tss_counts[(fid, orient)][sample].items():
+                    for pos, k in cnt.items():
+                        out.write(f"{fid}\t{orient}\t{sample}\t{c}\t{pos}\t{k}\n")
+    with gzip.open(f_3p, 'wt', compresslevel=5) as out:
+        out.write(header)
+        out.write("Feature\tOrientation\tCategory\tEnd\tCount\n")
+        for (fid, orient) in stats:
+            for c, cnt in end_counts[(fid, orient)].items():
+                for pos, k in cnt.items():
+                    out.write(f"{fid}\t{orient}\t{c}\t{pos}\t{k}\n")
+    print(f"Wrote merge state to {prefix}_state_{{features,5p,3p}}.tsv.gz")
+
+
+def _state_rows(path):
+    """(header dict, iterator over data rows split on tabs) for one state file."""
+    fh = gzip.open(path, 'rt')
+    first = fh.readline()
+    if not first.startswith('#'):
+        sys.exit(f"{path}: not an IsoClassifier state file (no header line)")
+    header = json.loads(first[1:])
+    fh.readline()                     # column names
+
+    def rows():
+        with fh:
+            for line in fh:
+                yield line.rstrip('\n').split('\t')
+    return header, rows()
+
+
+def _check_state_headers(headers, args):
+    """Refuse to merge runs that counted different things, unless --merge-allow-mismatch."""
+    problems = []
+    ref_src, ref = headers[0]
+    for src, h in headers:
+        if h.get('state_version') != STATE_VERSION:
+            problems.append(f"{src}: state version {h.get('state_version')} != {STATE_VERSION}")
+        for field in ('gff', 'gene_gff', 'args'):
+            if h.get(field) != ref.get(field):
+                problems.append(f"{src}: {field} differs from {ref_src}: "
+                                f"{h.get(field)} vs {ref.get(field)}")
+    # The merge reloads the annotation itself, so it has to be the one the samples were run on.
+    for field, mine in (('gff', _file_sig(args.gff)), ('gene_gff', _file_sig(args.gene_gff))):
+        if ref.get(field) != mine:
+            problems.append(f"--{field.replace('_', '-')} {mine} differs from the samples' "
+                            f"{ref.get(field)}")
+    for k in ('te_classes', 'canonical_exons_only'):
+        if ref['args'].get(k) != getattr(args, k):
+            problems.append(f"--{k} {getattr(args, k)!r} differs from the samples' "
+                            f"{ref['args'].get(k)!r}")
+    if problems:
+        msg = "State files disagree:\n  " + "\n  ".join(problems)
+        if not args.merge_allow_mismatch:
+            sys.exit(msg + "\nRe-run the samples consistently, or pass --merge-allow-mismatch.")
+        print("WARNING: " + msg)
+
+
+def load_states(sheet_path, feat_info, args):
+    """
+    Sum the per-sample state files listed in a merge sheet. Returns stats, tss_counts, end_counts
+    and the (library, platform) of every sample, indexed by the sample numbers used in tss_counts.
+    A sheet's Library/Platform, when given, overrides what the run recorded for all its samples.
+    """
+    rows = _read_sheet(sheet_path)
+    if not rows:
+        sys.exit(f"{sheet_path}: no samples listed")
+    stats, tss_counts, end_counts = {}, {}, {}
+    libraries = []
+    headers = []
+    missing = set()
+    for row in rows:
+        prefix = row['Source']
+        f_feat, f_5p, f_3p = _state_paths(prefix)
+        for f in (f_feat, f_5p, f_3p):
+            if not os.path.exists(f):
+                sys.exit(f"{f} not found (was {prefix} run with --write-state?)")
+        header, feat_rows = _state_rows(f_feat)
+        headers.append((prefix, header))
+        offset = len(libraries)
+        for smp in header['samples']:
+            libraries.append((row['Library'] or smp['library'],
+                              row['Platform'] or smp['platform']))
+
+        for fid, orient, c, n, slen, spl, j in feat_rows:
+            if fid not in feat_info:
+                missing.add(fid)
+                continue
+            key = (fid, orient)
+            _ensure_key(stats, tss_counts, end_counts, key)
+            rec = stats[key]
+            n = int(n)
+            rec['total'] += n
+            rec['counts'][c] += n
+            rec['lengths'][c] += int(slen)
+            rec['spliced'][c] += int(spl)
+            if j != '.':
+                rec['junctions'][c] |= {tuple(map(int, x.split('-'))) for x in j.split(';')}
+        _h, r5 = _state_rows(f_5p)
+        for fid, orient, sample, c, pos, n in r5:
+            key = (fid, orient)
+            if key not in stats:
+                continue
+            by_cat = tss_counts[key].setdefault(offset + int(sample), {})
+            cnt = by_cat.get(c)
+            if cnt is None:
+                cnt = by_cat[c] = Counter()
+            cnt[int(pos)] += int(n)
+        _h, r3 = _state_rows(f_3p)
+        for fid, orient, c, pos, n in r3:
+            key = (fid, orient)
+            if key not in stats:
+                continue
+            cnt = end_counts[key].get(c)
+            if cnt is None:
+                cnt = end_counts[key][c] = Counter()
+            cnt[int(pos)] += int(n)
+        print(f"Merge: loaded {prefix} ({len(header['samples'])} sample(s))")
+
+    _check_state_headers(headers, args)
+    if missing:
+        sys.exit(f"{len(missing)} features in the state files are not in --gff "
+                 f"(e.g. {sorted(missing)[:3]}); merge with the annotation the samples used.")
+    return stats, tss_counts, end_counts, libraries
+
+
+def library_halfwidths(libraries, args):
+    """Half-width per library from its platform; a library must have a single platform."""
+    hw = tss_consensus.parse_halfwidths(args.tss_halfwidths)
+    lib_platform = {}
+    for lib, plat in libraries:
+        if plat not in hw:
+            sys.exit(f"Library {lib}: unknown platform {plat!r} (known: {', '.join(sorted(hw))}; "
+                     f"add others with --tss-halfwidths name=bp)")
+        if lib_platform.setdefault(lib, plat) != plat:
+            sys.exit(f"Library {lib} is listed with two platforms ({lib_platform[lib]}, {plat})")
+    return {lib: hw[plat] for lib, plat in lib_platform.items()}, lib_platform
+
+
+def compute_tss_calls(feat_info, stats, tss_counts, parent_cache, libraries, args, n=10,
+                      evidence=None):
+    """
+    One TSS call per feature/orientation, shared by every writer that reports or uses a TSS, so the
+    TSS summaries, isoform tables, densities and U3/promoter sequences all agree. Samples are
+    summed into their library before the call. evidence: EvidenceTracks in priority order.
+    """
+    lib_hw, _ = library_halfwidths(libraries, args)
+    ev = dict(evidence=evidence or None, ev_window=args.tss_evidence_window,
+              ev_min=args.tss_evidence_min, ev_min_reads=args.tss_evidence_min_reads)
+    calls = {}
+    for key, rec in stats.items():
+        if rec['total'] == 0:
+            continue
+        fid, orient = key
+        by_sample = tss_counts.get(key, {})
+        lib_counts = {}
+        for sample, by_cat in by_sample.items():
+            c = lib_counts.setdefault(libraries[sample][0], Counter())
+            for cnt in by_cat.values():
+                c.update(cnt)
+        strand = _read_frame_strand(feat_info[fid], orient)
+        window, min_frac = tss_params(fid, parent_cache, args)
+        if args.tss_method == 'mode':
+            # Category-major, as the original per-read lists were pooled, so ties break the same way.
+            pooled = Counter()
+            for cat in ALL_CATS:
+                for sample in sorted(by_sample):
+                    cnt = by_sample[sample].get(cat)
+                    if cnt:
+                        pooled.update(cnt)
+            call = tss_consensus.call_tss_mode(pooled, lib_counts, lib_hw, strand, window,
+                                               min_frac, n, args.tss_lib_k, args.tss_min_lib_reads,
+                                               chrom=feat_info[fid]['chrom'], **ev)
+        else:
+            call = tss_consensus.call_tss(lib_counts, lib_hw, strand, window, min_frac, n,
+                                          args.tss_lib_k, args.tss_min_lib_reads,
+                                          chrom=feat_info[fid]['chrom'], **ev)
+        if call is not None:
+            calls[key] = call
+    return calls
+
+
+def _pooled_counter(tss_counts, key):
+    out = Counter()
+    for by_cat in tss_counts.get(key, {}).values():
+        for cnt in by_cat.values():
+            out.update(cnt)
+    return out
+
+
+def write_tss_consensus(feat_info, stats, tss_calls, libraries, prefix):
+    """TSS agreement across libraries, and each library's own peak, per feature/orientation."""
+    lib_platform = dict(libraries)
+    path = f"{prefix}_tss_consensus.tsv"
+    with open(path, 'w') as out:
+        out.write("\t".join(["Feature", "Class", "Orientation", "Total_Reads", "TSS1",
+                             "TSS1_Score", "TSS2", "TSS2_Score", "Libraries_Qualifying",
+                             "Samples_Supporting", "Support_Frac", "Low_Agreement",
+                             "TSS_Source", "Evidence_Support", "Reads_TSS1"]) + "\n")
+        for key, call in tss_calls.items():
+            fid, orient = key
+            s1 = call.sites[0]
+            s2 = call.sites[1] if len(call.sites) > 1 else ('NA', 0, None)
+            fmt = lambda v: 'NA' if v is None else f"{v:.4f}"
+            out.write("\t".join(map(str, [
+                fid, feat_info[fid]['class'], orient, stats[key]['total'], s1[0], fmt(s1[2]),
+                s2[0], fmt(s2[2]), call.n_qualifying, call.n_supporting,
+                fmt(call.support_frac), call.low_agreement, call.source, fmt(call.support),
+                call.reads_tss1])) + "\n")
+    print(f"Wrote {len(tss_calls)} consensus TSS records to {path}")
+
+    path = f"{prefix}_tss_by_library.tsv"
+    n_rows = 0
+    with open(path, 'w') as out:
+        out.write("Feature\tOrientation\tLibrary\tPlatform\tReads\tWeight\tOwn_Peak\tWithin_h\n")
+        for (fid, orient), call in tss_calls.items():
+            for lib, n, w, own, within in call.per_lib:
+                out.write(f"{fid}\t{orient}\t{lib}\t{lib_platform[lib]}\t{n}\t{w:.4f}\t"
+                          f"{own}\t{within}\n")
+                n_rows += 1
+    print(f"Wrote {n_rows} per-library TSS records to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1254,12 +2047,6 @@ def _report_cats(include_partial):
     return [c for c in ALL_CATS if include_partial or c != 'partial']
 
 
-def _pooled_origins(tss_positions, key):
-    out = []
-    for lst in tss_positions[key].values():
-        out.extend(lst)
-    return out
-
 
 def _read_frame_strand(rec, orient):
     """Transcription strand of the reads in a record: flipped from the element for antisense."""
@@ -1269,16 +2056,16 @@ def _read_frame_strand(rec, orient):
     return s
 
 
-def write_isoform_tables(feat_info, body_tree, stats, tss_positions, prefix, args):
+def write_isoform_tables(feat_info, stats, tss_calls, parent_cache, prefix, args):
     """
     Write per-feature isoform tables, split into sense and antisense files.
 
     Every feature reports against the union vocabulary; categories outside a feature's own
     vocabulary stay at zero (a gene never has an ltr5_contained read, a fragment never has a
-    spanning one). Nesting parents are computed only for features that received reads.
+    spanning one). Nesting parents come from the shared cache, which covers exactly the features
+    that received reads.
     """
     cats = _report_cats(args.include_partial)
-    parent_cache = {}
     rows_by_orient = defaultdict(list)
 
     for (fid, orient), rec in stats.items():
@@ -1287,15 +2074,12 @@ def write_isoform_tables(feat_info, body_tree, stats, tss_positions, prefix, arg
         if total == 0:
             continue
 
-        if fid not in parent_cache:
-            parents = nesting_parents(fid, feat_info, body_tree)
-            parent_cache[fid] = (parents,
-                                 [feat_info[p]['class'] for p in parents])
-        parents, parent_classes = parent_cache[fid]
+        parents = parent_cache.get(fid, [])
+        parent_classes = [feat_info[p]['class'] for p in parents]
 
-        peak, _peak_cnt, peak_frac, called = compute_tss_peak(
-            _pooled_origins(tss_positions, (fid, orient)),
-            args.tss_window, args.tss_min_frac)
+        call = tss_calls.get((fid, orient))
+        peak, peak_frac, called = ((call.sites[0][0], call.peak_frac, call.called) if call
+                                   else ('NA', 0.0, 0))
 
         row = {
             'Feature': fid,
@@ -1340,7 +2124,7 @@ def write_isoform_tables(feat_info, body_tree, stats, tss_positions, prefix, arg
         print(f"Wrote {len(rows)} {orient} isoform records to {out_path}")
 
 
-def write_isoform_tss_summary(feat_info, stats, tss_positions, out_path, args, n=2,
+def write_isoform_tss_summary(feat_info, stats, tss_calls, out_path, args, n=2,
                               orient_filter=None):
     """
     Top isoform and top-n TSS positions per feature and orientation.
@@ -1351,7 +2135,7 @@ def write_isoform_tss_summary(feat_info, stats, tss_positions, out_path, args, n
     """
     cats = _report_cats(args.include_partial)
     with open(out_path, 'w') as out:
-        hdr = ["Feature", "Class", "Orientation", "Top_Isoform", "Strand", "Total_Reads",
+        hdr = ["Feature", "Class", "Orientation", "Top_Isoform", "Strand", "Chrom", "Total_Reads",
                "TSS_Called", "TSS_Peak_Frac"]
         for i in range(1, n + 1):
             hdr += [f"TSS{i}", f"Count{i}"]
@@ -1366,24 +2150,22 @@ def write_isoform_tss_summary(feat_info, stats, tss_positions, out_path, args, n
             if rec['counts'][top_cat] == 0:
                 continue
 
-            origins = _pooled_origins(tss_positions, (fid, orient))
-            peak, peak_cnt, peak_frac, called = compute_tss_peak(
-                origins, args.tss_window, args.tss_min_frac)
-
             # Pooled across categories, matching TSS_Peak in the isoform table. Ranking only
             # the top category made TSS1 here a different quantity from TSS_Peak there.
-            common = Counter(origins).most_common(n)
+            call = tss_calls[(fid, orient)]
+            peak_frac, called = call.peak_frac, call.called
+            common = [(pos, raw) for pos, raw, _sc in call.sites[:n]]
             common += [("NA", 0)] * (n - len(common))
 
             row = [fid, info['class'], orient, top_cat, _read_frame_strand(info, orient),
-                   str(total), str(called), f"{peak_frac:.4f}"]
+                   info['chrom'], str(total), str(called), f"{peak_frac:.4f}"]
             for tss, cnt in common:
                 row += [str(tss), str(cnt)]
             out.write("\t".join(row) + "\n")
     print(f"Wrote isoform TSS summary to {out_path}")
 
 
-def write_cleavage_summary(feat_info, stats, end_positions, out_path, args, n=10, window=5):
+def write_cleavage_summary(feat_info, stats, end_counts, out_path, args, n=10, window=5):
     """3'-end (cleavage) distribution per feature and orientation, pooled across categories."""
     with open(out_path, "w") as out:
         hdr = ["Feature", "Class", "Orientation", "Strand", "Total_Reads",
@@ -1394,14 +2176,14 @@ def write_cleavage_summary(feat_info, stats, end_positions, out_path, args, n=10
         out.write("\t".join(hdr) + "\n")
 
         for (fid, orient), rec in stats.items():
-            all_ends = []
+            ctr = Counter()
+            by_cat = end_counts[(fid, orient)]
             for cat, cnt in rec["counts"].items():
-                if cnt:
-                    all_ends.extend(end_positions[(fid, orient)][cat])
-            if not all_ends:
+                if cnt and cat in by_cat:
+                    ctr.update(by_cat[cat])
+            if not ctr:
                 continue
 
-            ctr = Counter(all_ends)
             total = sum(ctr.values())
             common = ctr.most_common()
             top_n = common[:n] + [("NA", 0)] * (n - len(common[:n]))
@@ -1419,7 +2201,7 @@ def write_cleavage_summary(feat_info, stats, end_positions, out_path, args, n=10
     print(f"Wrote top-{n} cleavage summary to {out_path}")
 
 
-def write_gene_summary(feat_info, stats, tss_positions, out_path, args, n=2):
+def write_gene_summary(feat_info, stats, tss_calls, out_path, args, n=2):
     """Gene read counts and top-n TSS positions, one row per gene and orientation."""
     with open(out_path, 'w') as out:
         hdr = ["Gene", "Orientation", "Total_Reads", "TSS_Called", "TSS_Peak_Frac"]
@@ -1431,9 +2213,9 @@ def write_gene_summary(feat_info, stats, tss_positions, out_path, args, n=2):
         for (fid, orient), rec in stats.items():
             if feat_info[fid]['class'] != 'Gene' or rec['total'] == 0:
                 continue
-            origins = _pooled_origins(tss_positions, (fid, orient))
-            _, _, peak_frac, called = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
-            common = Counter(origins).most_common(n)
+            call = tss_calls[(fid, orient)]
+            peak_frac, called = call.peak_frac, call.called
+            common = [(pos, raw) for pos, raw, _sc in call.sites[:n]]
             common += [("NA", 0)] * (n - len(common))
             row = [fid, orient, str(rec['total']), str(called), f"{peak_frac:.4f}"]
             for tss, cnt in common:
@@ -1443,7 +2225,7 @@ def write_gene_summary(feat_info, stats, tss_positions, out_path, args, n=2):
     print(f"Wrote {n_rows} gene summary records to {out_path}")
 
 
-def compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=1,
+def compute_tss_density(stats, tss_counts, tss_calls, feat_info, window=10, min_reads=1,
                         include_tss_reads=True, klass=None):
     """
     Per feature and orientation, histograms of read 5' ends around the primary and secondary TSS.
@@ -1464,15 +2246,12 @@ def compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=1,
         if klass is None and info['class'] == 'Gene':
             continue
 
-        origins = _pooled_origins(tss_positions, (fid, orient))
-        if not origins:
+        call = tss_calls.get((fid, orient))
+        if call is None:
             continue
-        common = Counter(origins).most_common(2)
-        while len(common) < 2:
-            common.append((None, 0))
-        (tss1, _), (tss2, _) = common
-        if tss1 is None:
-            continue
+        origins = _pooled_counter(tss_counts, (fid, orient))
+        tss1 = call.sites[0][0]
+        tss2 = call.sites[1][0] if len(call.sites) > 1 else None
 
         strand = _read_frame_strand(info, orient)
         hist1 = np.zeros(size, dtype=int)
@@ -1481,14 +2260,14 @@ def compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=1,
         for target, hist in ((tss1, hist1), (tss2, hist2)):
             if target is None:
                 continue
-            for o in origins:
+            for o, k in origins.items():
                 if not include_tss_reads and o == target:
                     continue
                 d = o - target
                 if strand == '-':
                     d = -d
                 if -window <= d <= window:
-                    hist[d + window] += 1
+                    hist[d + window] += k
 
         density[(fid, orient)] = {'primary': hist1, 'secondary': hist2}
 
@@ -1514,7 +2293,7 @@ def _extract_region(fa, chrom, start1, end1, strand):
     return seq.reverse_complement() if strand == '-' else seq
 
 
-def u3_seq_extraction(genome_fasta, feat_info, stats, tss_positions, output_prefix, args):
+def u3_seq_extraction(genome_fasta, feat_info, stats, tss_calls, output_prefix, args):
     """
     Extract U3/LTR sequences for structural LTR-RTs and promoter regions for genes.
 
@@ -1549,11 +2328,10 @@ def u3_seq_extraction(genome_fasta, feat_info, stats, tss_positions, output_pref
             n_skipped['unresolved strand'] += 1
             continue
 
-        origins = _pooled_origins(tss_positions, (fid, orient))
-        peak, _, _, _ = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
-        if peak == 'NA':
+        call = tss_calls.get((fid, orient))
+        if call is None:
             continue
-        tss0 = peak
+        tss0 = call.sites[0][0]
         tss1 = tss0 + 1
 
         ltr_left, ltr_right = info['ltr_left'], info['ltr_right']
@@ -1607,11 +2385,10 @@ def u3_seq_extraction(genome_fasta, feat_info, stats, tss_positions, output_pref
             if chrom not in contigs or strand not in ('+', '-'):
                 continue
 
-            origins = _pooled_origins(tss_positions, (fid, orient))
-            peak, _, _, _ = compute_tss_peak(origins, args.tss_window, args.tss_min_frac)
-            if peak == 'NA':
+            call = tss_calls.get((fid, orient))
+            if call is None:
                 continue
-            tss1 = peak + 1
+            tss1 = call.sites[0][0] + 1
             chrom_len = fa.get_reference_length(chrom)
 
             prom_start0 = max(0, tss1 - 1000)
@@ -1646,47 +2423,82 @@ def main():
     feat_info, body_tree = load_elements_and_ranges(
         args.gff, args.te_classes, args.gene_gff, args.canonical_exons_only)
 
-    stats, tss_positions, end_positions = classify_multiple_bams(
-        feat_info, body_tree, args.bam, args.min_mapq, args,
-        clip_out_splice=clip_out_splice,
-        clip_out_nonsplice=clip_out_nonsplice,
-        elem_exon_out=elem_exon_out,
-        gene_exon_out=gene_exon_out,
-        n_threads=args.threads)
+    if args.merge_sheet:
+        # Merge mode: no BAMs are read. Separate runs' states are summed per library, strands of
+        # unknown-strand features are resolved on the summed support, and the usual summaries follow.
+        stats, tss_counts, end_counts, libraries = load_states(args.merge_sheet, feat_info, args)
+        report_features(feat_info, stats,
+                        resolve_unknown_strands(feat_info, stats, tss_counts, end_counts))
+    else:
+        libraries = args.libraries = resolve_libraries(args.bam, args)
+        library_halfwidths(libraries, args)          # fail on an unknown platform before the BAM pass
+        stats, tss_counts, end_counts = classify_multiple_bams(
+            feat_info, body_tree, args.bam, args.min_mapq, args,
+            clip_out_splice=clip_out_splice,
+            clip_out_nonsplice=clip_out_nonsplice,
+            elem_exon_out=elem_exon_out,
+            gene_exon_out=gene_exon_out,
+            n_threads=args.threads)
+
+    # Nesting parents, resolved once and shared by the isoform table and every TSS writer. They
+    # decide which TSS threshold each feature is held to, so they have to be built before any of
+    # the summaries are written.
+    parent_cache = build_parent_cache(feat_info, body_tree, stats)
+    n_nested = sum(1 for p in parent_cache.values() if p)
+    print(f"Nesting resolved for {len(parent_cache)} features with reads: {n_nested} nested "
+          f"(strict TSS window {args.tss_window} bp, min frac {args.tss_min_frac}), "
+          f"{len(parent_cache) - n_nested} unnested (window "
+          f"{args.tss_window_unnested if args.tss_window_unnested is not None else args.tss_window}"
+          f" bp, min frac {args.tss_min_frac_unnested}).")
+
+    # One TSS call per feature/orientation, used by every writer below
+    evidence = [tss_consensus.load_evidence(sp) for sp in (args.tss_evidence or [])]
+    for tr in evidence:
+        print(f"TSS evidence '{tr.name}': {len(tr):,} positions")
+    tss_calls = compute_tss_calls(feat_info, stats, tss_counts, parent_cache, libraries, args,
+                                  evidence=evidence)
+    print(f"TSS called for {len(tss_calls)} feature/orientation records "
+          f"(method {args.tss_method}, {len(dict(libraries))} library(ies)).")
+    if evidence:
+        src = Counter(c.source for c in tss_calls.values())
+        moved = sum(1 for c in tss_calls.values() if c.sites[0][0] != c.reads_tss1)
+        print("  TSS1 chosen by: " + ", ".join(f"{k}={v}" for k, v in src.most_common())
+              + f"; {moved} moved from the reads-only call")
+    write_tss_consensus(feat_info, stats, tss_calls, libraries, args.output)
 
     # Isoform tables, split sense/antisense
-    write_isoform_tables(feat_info, body_tree, stats, tss_positions, args.output, args)
+    write_isoform_tables(feat_info, stats, tss_calls, parent_cache, args.output, args)
 
     # TSS and cleavage summaries (Orientation column)
-    write_isoform_tss_summary(feat_info, stats, tss_positions, args.tss_out, args, n=2)
-    write_isoform_tss_summary(feat_info, stats, tss_positions,
+    write_isoform_tss_summary(feat_info, stats, tss_calls, args.tss_out, args, n=2)
+    write_isoform_tss_summary(feat_info, stats, tss_calls,
                               args.output + "_10site.tss_summary.tsv", args, n=10)
     # Single-orientation copies: WindowScrubber keys tss_map on Feature, so it needs exactly one
     # row per feature. Pair these with the matching _u3_seqs_<orient>.fa / _ltr_seqs_<orient>.fa.
     for _o in ('sense', 'antisense'):
-        write_isoform_tss_summary(feat_info, stats, tss_positions,
+        write_isoform_tss_summary(feat_info, stats, tss_calls,
                                   f"{args.output}_{_o}.tss_summary.tsv", args, n=10,
                                   orient_filter=_o)
-    write_cleavage_summary(feat_info, stats, end_positions,
+    write_cleavage_summary(feat_info, stats, end_counts,
                            args.output + "_10site.cleavage_summary.tsv", args, n=10)
 
     # Gene summaries (Orientation column)
-    write_gene_summary(feat_info, stats, tss_positions, args.gene_out, args, n=2)
-    write_gene_summary(feat_info, stats, tss_positions,
+    write_gene_summary(feat_info, stats, tss_calls, args.gene_out, args, n=2)
+    write_gene_summary(feat_info, stats, tss_calls,
                        args.output + "_10site.gene_summary.tsv", args, n=10)
 
     # TSS densities
-    te_dens = compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=6)
+    te_dens = compute_tss_density(stats, tss_counts, tss_calls, feat_info, window=10, min_reads=6)
     write_density(te_dens, args.output + '_primary_tss_density.tsv', 'primary')
     write_density(te_dens, args.output + '_secondary_tss_density.tsv', 'secondary')
 
-    gene_dens = compute_tss_density(stats, tss_positions, feat_info, window=10, min_reads=7,
+    gene_dens = compute_tss_density(stats, tss_counts, tss_calls, feat_info, window=10, min_reads=7,
                                     klass='Gene')
     write_density(gene_dens, args.output + '_gene_primary_density.tsv', 'primary', label="Gene")
     write_density(gene_dens, args.output + '_gene_secondary_density.tsv', 'secondary', label="Gene")
 
     if args.genome_fasta:
-        u3_seq_extraction(args.genome_fasta, feat_info, stats, tss_positions, args.output, args)
+        u3_seq_extraction(args.genome_fasta, feat_info, stats, tss_calls, args.output, args)
 
 
 if __name__ == '__main__':
