@@ -1,3 +1,15 @@
 test/output/
 test/pychopper.tsv
 test/10site.*.tsv
+test/baseline_decltr/
+results/
+__pycache__/
+/*.qs
+/Segmented_Breakpoints.csv
+/pychopper.tsv
+
+# nested EM test output
+test/nested_em/output/
+
+# consensus TSS test output
+test/tss_consensus/output/
