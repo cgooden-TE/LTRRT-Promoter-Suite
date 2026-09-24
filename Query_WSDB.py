@@ -26,6 +26,10 @@ Usage examples:
 
 7. Get CA run summary:
    python Query_WSDB.py -db motif_hits.db --ca-summary --output ca_summary.tsv
+
+8. Restrict any mode to element classes or a promoter schema (U3 vs TSS_window):
+   python Query_WSDB.py -db motif_hits.db --best-all-motifs --class Gene,TIR --output best_dna.tsv
+   python Query_WSDB.py -db motif_hits.db --stats --anchor-mode U3
    
 """
 
@@ -41,6 +45,37 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def restrict_elements(conn: sqlite3.Connection, classes: Optional[List[str]],
+                      anchor_mode: Optional[str]):
+    """
+    Shadow elements/motif_hits/ta_regions/ca_runs with TEMP views limited to the chosen element
+    classes and anchor mode. SQLite resolves unqualified names to temp before main, so every
+    query mode below picks up the restriction unchanged.
+    """
+    if not classes and not anchor_mode:
+        return
+    cols = {r['name'] for r in conn.execute("PRAGMA main.table_info(elements)")}
+    if 'anchor_mode' not in cols:
+        raise SystemExit("--class/--anchor-mode need a DB built by the class-aware WindowScrubber")
+    where, params = [], []
+    if classes:
+        where.append(f"element_class IN ({','.join('?' * len(classes))})")
+        params.extend(classes)
+    if anchor_mode:
+        where.append("anchor_mode = ?")
+        params.append(anchor_mode)
+    # Set before creating temp objects: changing temp_store later would drop them
+    conn.execute("PRAGMA temp_store = MEMORY")
+    keep = [r[0] for r in conn.execute(
+        f"SELECT feature FROM main.elements WHERE {' AND '.join(where)}", params)]
+    conn.execute("CREATE TEMP TABLE _keep (feature TEXT PRIMARY KEY)")
+    conn.executemany("INSERT INTO _keep VALUES (?)", [(f,) for f in keep])
+    for t in ('elements', 'motif_hits', 'ta_regions', 'ca_runs'):
+        conn.execute(f"CREATE TEMP VIEW {t} AS SELECT * FROM main.{t} "
+                     f"WHERE feature IN (SELECT feature FROM temp._keep)")
+    conn.commit()  # close the implicit transaction; later PRAGMAs refuse to run inside one
 
 
 def query_best_per_element(conn: sqlite3.Connection, motif_type: str, 
@@ -514,6 +549,10 @@ def parse_args():
     p.add_argument('--max-dist', type=int, help='Maximum absolute distance to TSS')
     p.add_argument('--in-ta-region', action='store_true', help='Only hits in TA-rich regions')
     p.add_argument('--features', help='Comma-separated list of features to include')
+    p.add_argument('--class', dest='element_class',
+                   help='Comma-separated element classes to include (e.g. Gene,TIR,LTR_structural)')
+    p.add_argument('--anchor-mode', choices=['U3', 'TSS_window'],
+                   help='Only elements scanned under this schema')
 
     # Range/threshold controls
     p.add_argument('--range', help='Single motif relative lo:hi for distance to TSS (e.g. "-100:0")')
@@ -544,6 +583,10 @@ def main():
     conn = get_connection(args.database)
     
     try:
+        restrict_elements(conn,
+                          args.element_class.split(',') if args.element_class else None,
+                          args.anchor_mode)
+
         if args.stats:
             stats = get_statistics(conn)
             print_statistics(stats)

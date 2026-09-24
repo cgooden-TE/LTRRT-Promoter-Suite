@@ -2,30 +2,44 @@
 """
 Database-enabled motif scanner: stores ALL motif hits for flexible post-analysis filtering.
 
+Every element is anchored on its IsoClassifier TSS and scanned with the same TSS-relative motif
+bands. Two schemas decide the scanned sequence and the TA-rich search zone:
+  U3          LTR_structural with TSS1 inside the TSS-bearing LTR (LTR FASTA supplied).
+              Sequence = that LTR; TA-rich zone = U3, derived as upstream LTR edge .. TSS1.
+  TSS_window  Everything else (genes, TIR, Helitron, LINE, SINE, LTR_fragment, and structural
+              LTRs without a usable U3). Sequence = genome window TSS-flank_up .. TSS+flank_down;
+              TA-rich zone = fixed core band TSS-core_up .. TSS+core_down. No U3 is imputed.
+
+Sequences are always pulled from the genome in the transcript's frame; the LTR FASTA only
+supplies coordinates, so its orientation convention cannot flip a scan.
+
 Database Schema:
-  elements: Feature metadata and TSS
+  elements:   Feature metadata, class, anchor mode, scanned span, TSS, TA-search zone
   ta_regions: TA-rich regions per element
-  ca_runs: All significant CA runs with p-values
+  ca_runs:    All significant CA runs with p-values
   motif_hits: All motif matches above threshold
-  
+  thresholds: Per-motif score cutoffs
+  run_params: Parameters used to build the database
+
 Inputs:
-    - LTR FASTA with headers: >Feature|chr:start-end(strand)
-    - U3 FASTA with same headers, sequences = U3 regions
-    - TSS summary TSV: Feature, TSS1 absolute coordinates
-    - DB Name for output SQLite database
+    - TSS summary TSV from IsoClassifier (*_sense.tss_summary.tsv): Feature, Class, Orientation,
+      Strand, Chrom, TSS1 (0-based)
+    - Genome FASTA (faidx-indexed)
+    - Optional LTR FASTA from IsoClassifier (*_ltr_seqs_<orient>.fa) for the U3 schema
+    - Optional IsoClassifier isoform table, to supply Chrom for older TSS summaries lacking it
 
 Usage Example:
   python3 WindowScrubber.py \
-    -l full_ltr_sequences.fa \
-    -u3 u3_regions.fa \
-    -t tss_summary.tsv \
+    -t iso_sense.tss_summary.tsv \
+    -g B73.PLATINUM.pseudomolecules-v1.fasta \
+    -l iso_ltr_seqs_sense.fa \
     -db motif_hits.db \
     --tata_mismatch 1 --ccaat_mismatch 0
-    
-Query examples (see query_db.py companion script):
+
+Query examples (see Query_WSDB.py companion script):
   - Best TATA per element by score
   - All TATA hits within TA-rich regions
-  - Motifs within distance ranges
+  - Motifs within distance ranges, per element class or anchor mode
   - Statistical summaries
 """
 import argparse
@@ -40,8 +54,9 @@ from typing import Dict, List, Tuple, Optional
 
 import random
 import bisect
+from dataclasses import dataclass
 
-
+import pysam
 from Bio import SeqIO
 from Bio.Seq import Seq
 
@@ -367,18 +382,35 @@ def init_database(db_path: str) -> sqlite3.Connection:
         )
     ''')
     
-    # Elements table
+    # Run parameters (flanks, core band, inputs) so each DB documents its own schema choices
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS run_params (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
+    # Elements table: seq_start/seq_end = scanned span (LTR in U3 mode, genome window otherwise);
+    # zone_start/zone_end = TA-rich search zone; u3_* is NULL outside U3 mode. All 1-based inclusive.
     c.execute('''
         CREATE TABLE IF NOT EXISTS elements (
             feature TEXT PRIMARY KEY,
+            element_class TEXT,
+            orientation TEXT,
+            anchor_mode TEXT,
             chrom TEXT,
-            ltr_start INTEGER,
-            ltr_end INTEGER,
+            seq_start INTEGER,
+            seq_end INTEGER,
             strand TEXT,
             u3_start INTEGER,
             u3_end INTEGER,
+            zone_start INTEGER,
+            zone_end INTEGER,
             tss_abs INTEGER,
             tss_rel INTEGER,
+            total_reads INTEGER,
+            tss_called INTEGER,
+            seq_truncated INTEGER,
             sequence TEXT,
             sequence_length INTEGER
         )
@@ -449,6 +481,9 @@ def init_database(db_path: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_mh_type_dist_score
         ON motif_hits(motif_type, dist_to_tss, score DESC);
 
+        -- On elements
+        CREATE INDEX IF NOT EXISTS idx_el_class_mode ON elements(element_class, anchor_mode);
+
         -- On ta_regions
         CREATE INDEX IF NOT EXISTS idx_ta_feature ON ta_regions(feature);
 
@@ -505,6 +540,169 @@ def frac_bases(seq: str, allowed: set) -> float:
     return sum(1 for b in seq if b in allowed) / len(seq)
 
 
+# ------------------------------
+# Element construction (U3 vs TSS_window schemas)
+# ------------------------------
+
+ALL_CLASSES = ('LTR_structural', 'LTR_fragment', 'TIR', 'Helitron', 'LINE', 'SINE', 'Gene')
+DEFAULT_GENOME = '/home/caleb/data/genome_and_annotations/B73.PLATINUM.pseudomolecules-v1.fasta'
+
+
+@dataclass
+class Element:
+    """One TSS-anchored scan unit. seq is oriented 5'->3' in the transcript's frame."""
+    feature: str
+    cls: str
+    orientation: str
+    chrom: str
+    strand: str
+    anchor_mode: str          # 'U3' or 'TSS_window'
+    seq_start: int            # 1-based inclusive span of seq
+    seq_end: int
+    seq: str
+    tss_abs: int              # 1-based
+    tss_rel: int              # 0-based index into seq
+    zone_lo: int              # oriented half-open TA-search zone [zone_lo, zone_hi)
+    zone_hi: int
+    truncated: int
+    total_reads: Optional[int]
+    tss_called: Optional[int]
+
+
+def _int_or_none(x) -> Optional[int]:
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_tss_summary(path: str, orientation: str, classes: set,
+                     chrom_fallback: Dict[str, str]) -> List[dict]:
+    """
+    Read an IsoClassifier tss_summary. TSS1 is 0-based there and is converted to 1-based here.
+    Rows are filtered to one orientation so Feature is unique; duplicates keep the first row.
+    """
+    rows, seen = [], set()
+    skipped = {}
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    with open(path) as fh:
+        rdr = csv.DictReader(fh, delimiter='\t')
+        missing = {'Feature', 'Class', 'Strand', 'TSS1'} - set(rdr.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path} lacks columns {sorted(missing)}; "
+                             "use an IsoClassifier *_{sense,antisense}.tss_summary.tsv")
+        for r in rdr:
+            orient = r.get('Orientation', orientation)
+            if orient != orientation:
+                continue
+            if r['Class'] not in classes:
+                skip(f"class {r['Class']} not selected")
+                continue
+            tss0 = _int_or_none(r['TSS1'])
+            if tss0 is None:
+                skip('no TSS1')
+                continue
+            if r['Strand'] not in ('+', '-'):
+                skip('unresolved strand')
+                continue
+            feat = r['Feature']
+            if feat in seen:
+                skip('duplicate feature')
+                continue
+            seen.add(feat)
+            rows.append({
+                'feature': feat, 'cls': r['Class'], 'orientation': orient,
+                'strand': r['Strand'],
+                'chrom': r.get('Chrom') or chrom_fallback.get(feat),
+                'tss_abs': tss0 + 1,
+                'total_reads': _int_or_none(r.get('Total_Reads')),
+                'tss_called': _int_or_none(r.get('TSS_Called')),
+            })
+    for k, v in skipped.items():
+        logging.info(f"TSS summary: skipped {v} rows ({k})")
+    return rows
+
+
+def load_chrom_map(isoforms_path: Optional[str]) -> Dict[str, str]:
+    """Feature -> Chrom from an IsoClassifier isoform table (for TSS summaries without Chrom)."""
+    if not isoforms_path:
+        return {}
+    out = {}
+    with open(isoforms_path) as fh:
+        for r in csv.DictReader(fh, delimiter='\t'):
+            out.setdefault(r['Feature'], r['Chrom'])
+    return out
+
+
+def load_ltr_coords(path: Optional[str], orientation: str) -> Dict[str, Tuple[str, int, int, str]]:
+    """
+    Feature -> (chrom, start1, end1, strand) of the TSS-bearing LTR from IsoClassifier's
+    *_ltr_seqs_<orient>.fa. Only header coordinates are used; sequence comes from the genome.
+    """
+    if not path:
+        return {}
+    out = {}
+    for rec in SeqIO.parse(path, 'fasta'):
+        parts = rec.id.split('|')
+        if len(parts) >= 3 and parts[2] != orientation:
+            continue
+        feat, chrom, s, e, strand = parse_header(rec.id)
+        out[feat] = (chrom, s, e, strand)
+    return out
+
+
+def fetch_oriented(fa: pysam.FastaFile, chrom: str, s1: int, e1: int, strand: str) -> str:
+    """Fetch 1-based inclusive [s1, e1] and orient to the given strand."""
+    seq = fa.fetch(chrom, s1 - 1, e1).upper()
+    return str(Seq(seq).reverse_complement()) if strand == '-' else seq
+
+
+def build_element(row: dict, fa: pysam.FastaFile, chrom_len: Dict[str, int],
+                  ltr_coords: Dict[str, Tuple[str, int, int, str]], args) -> Tuple[Optional[Element], str]:
+    """
+    Choose the schema for one TSS-summary row and build its scan unit.
+    Returns (element, reason); element is None when the row cannot be scanned.
+    """
+    feat, strand, tss_abs = row['feature'], row['strand'], row['tss_abs']
+    chrom = row['chrom']
+    common = dict(feature=feat, cls=row['cls'], orientation=row['orientation'], strand=strand,
+                  total_reads=row['total_reads'], tss_called=row['tss_called'])
+
+    # U3 schema: structural LTR whose TSS1 sits inside the TSS-bearing LTR
+    if row['cls'] == 'LTR_structural' and feat in ltr_coords:
+        l_chrom, l_s, l_e, l_strand = ltr_coords[feat]
+        chrom = chrom or l_chrom
+        if l_chrom == chrom and l_strand == strand and l_s <= tss_abs <= l_e and chrom in chrom_len:
+            mapper = OrientedCoords(l_s, l_e, strand)
+            tss_rel = mapper.abs_to_rel(tss_abs)
+            # Oriented index 0 is the upstream LTR edge, so U3 = [0, tss_rel)
+            return Element(chrom=chrom, anchor_mode='U3', seq_start=l_s, seq_end=l_e,
+                           seq=fetch_oriented(fa, chrom, l_s, l_e, strand),
+                           tss_abs=tss_abs, tss_rel=tss_rel, zone_lo=0, zone_hi=tss_rel,
+                           truncated=0, **common), 'U3'
+
+    # TSS_window schema: fixed window from the genome, fixed core band as TA-search zone
+    if not chrom:
+        return None, 'no chrom'
+    if chrom not in chrom_len:
+        return None, 'contig missing from genome'
+    if strand == '+':
+        want_s, want_e = tss_abs - args.flank_up, tss_abs + args.flank_down
+    else:
+        want_s, want_e = tss_abs - args.flank_down, tss_abs + args.flank_up
+    s1, e1 = max(1, want_s), min(chrom_len[chrom], want_e)
+    mapper = OrientedCoords(s1, e1, strand)
+    seq = fetch_oriented(fa, chrom, s1, e1, strand)
+    tss_rel = mapper.abs_to_rel(tss_abs)
+    zone_lo = max(0, tss_rel - args.core_up)
+    zone_hi = min(len(seq), tss_rel + args.core_down)
+    return Element(chrom=chrom, anchor_mode='TSS_window', seq_start=s1, seq_end=e1, seq=seq,
+                   tss_abs=tss_abs, tss_rel=tss_rel, zone_lo=zone_lo, zone_hi=zone_hi,
+                   truncated=int((s1, e1) != (want_s, want_e)), **common), 'TSS_window'
+
 
 # ------------------------------
 # Argument parsing
@@ -512,14 +710,40 @@ def frac_bases(seq: str, allowed: set) -> float:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Database-enabled motif scanner with flexible post-analysis filtering.\
-            Required inputs: LTR FASTA (-l), U3 FASTA (-u3), TSS summary TSV (-t). Outputs SQLite database (-db) of motif hits and metadata.'
+        description='TSS-anchored promoter motif scanner. LTR_structural elements with a TSS inside '
+                    'an LTR use the U3 schema; all other classes use a fixed genome window around '
+                    'the TSS. Outputs an SQLite database (-db) of motif hits and metadata.'
     )
-    # Input files and output filenames 
-    p.add_argument('-l', '--ltr-fasta', required=True, help='FASTA of full LTR sequences')
-    p.add_argument('-u3', '--u3-fasta', required=True, help='FASTA of U3 regions')
-    p.add_argument('-t', '--tss-summary', required=True, help='TSV: Feature, TSS1 absolute coordinates')
+    # Input files and output filenames
+    p.add_argument('-t', '--tss-summary', required=True,
+                   help='IsoClassifier *_{sense,antisense}.tss_summary.tsv '
+                        '(Feature, Class, Orientation, Strand, Chrom, TSS1 0-based)')
+    p.add_argument('-g', '--genome-fasta', default=DEFAULT_GENOME,
+                   help='faidx-indexed genome FASTA (default: B73v5 PLATINUM)')
+    p.add_argument('-l', '--ltr-fasta', default=None,
+                   help='IsoClassifier *_ltr_seqs_<orient>.fa; supplies LTR bounds for the U3 schema. '
+                        'Without it every element uses the TSS_window schema')
+    p.add_argument('-u3', '--u3-fasta', default=None,
+                   help='Deprecated, ignored: U3 is derived as upstream LTR edge .. TSS1 so it always '
+                        'agrees with the scan anchor')
+    p.add_argument('-i', '--isoforms', default=None,
+                   help='IsoClassifier *_{sense,antisense}.isoforms.tsv; supplies Chrom when the TSS '
+                        'summary predates the Chrom column')
     p.add_argument('-db', '--database', required=True, help='Output SQLite database file')
+
+    # Element selection and TSS_window geometry
+    p.add_argument('--orientation', choices=['sense', 'antisense'], default='sense',
+                   help='Orientation rows to scan (default sense)')
+    p.add_argument('--classes', default=','.join(ALL_CLASSES),
+                   help=f'Comma-separated element classes to scan (default: {",".join(ALL_CLASSES)})')
+    p.add_argument('--flank-up', type=int, default=500,
+                   help='TSS_window: bp upstream of TSS to scan (default 500; CCAAT band needs >=460)')
+    p.add_argument('--flank-down', type=int, default=200,
+                   help='TSS_window: bp downstream of TSS to scan (default 200; SEC_TATA needs >=120)')
+    p.add_argument('--core-up', type=int, default=100,
+                   help='TSS_window: TA-rich zone starts this many bp upstream of TSS (default 100)')
+    p.add_argument('--core-down', type=int, default=0,
+                   help='TSS_window: TA-rich zone ends this many bp downstream of TSS (default 0)')
 
     # Sliding window parameters
     p.add_argument('--window-size', type=int, default=10, help='Sliding window size for TA-rich detection')
@@ -637,6 +861,9 @@ def main():
     # Initialize database
     conn = init_database(args.database)
     c = conn.cursor()
+    el_cols = {r[1] for r in c.execute("PRAGMA table_info(elements)")}
+    if 'anchor_mode' not in el_cols:
+        raise SystemExit(f"{args.database} has the pre-schema-v2 elements table; write to a new DB path")
     
     random.seed(args.random_seed)
 
@@ -674,68 +901,64 @@ def main():
     scan_thr = {name: store_thr[name] for name in store_thr}
 
 
-    # Load U3 coordinates
-    u3_map = {}
-    for rec in SeqIO.parse(args.u3_fasta, 'fasta'):
-        feat, _chrom, s, e, strand = parse_header(rec.id)
-        u3_map[feat] = (s, e, strand)
-    logging.info(f"Loaded U3 coords for {len(u3_map)} features")
+    # Record run parameters so each DB documents its schema geometry
+    for k in ('tss_summary', 'genome_fasta', 'ltr_fasta', 'orientation', 'classes',
+              'flank_up', 'flank_down', 'core_up', 'core_down', 'window_size', 'step_size',
+              'ta_threshold', 'tata_max_dist', 'inr_max_dist'):
+        c.execute("INSERT OR REPLACE INTO run_params VALUES (?, ?)", (k, str(getattr(args, k))))
 
-    # Load TSS
-    tss_map = {}
-    with open(args.tss_summary) as tf:
-        rdr = csv.DictReader(tf, delimiter='\t')
-        for row in rdr:
-            f = row.get('Feature', row.get('Gene'))
-            try:
-                tss_map[f] = int(row.get('TSS1', ''))
-            except (TypeError, ValueError):
-                continue
-    logging.info(f"Loaded {len(tss_map)} TSS entries")
+    if args.u3_fasta:
+        logging.warning("--u3-fasta is ignored; U3 is derived from the LTR bounds and TSS1")
 
+    # Load inputs
+    classes = {x.strip() for x in args.classes.split(',') if x.strip()}
+    rows = load_tss_summary(args.tss_summary, args.orientation, classes,
+                            load_chrom_map(args.isoforms))
+    logging.info(f"Loaded {len(rows)} {args.orientation} TSS entries")
+    ltr_coords = load_ltr_coords(args.ltr_fasta, args.orientation)
+    logging.info(f"Loaded LTR coords for {len(ltr_coords)} features")
+    fa = pysam.FastaFile(args.genome_fasta)
+    chrom_len = dict(zip(fa.references, fa.lengths))
 
     total_tests = 0
+    outcome = {}
 
-    for rec in SeqIO.parse(args.ltr_fasta, 'fasta'):
-        feat, chrom, ltr_s, ltr_e, strand = parse_header(rec.id)
-        if feat not in u3_map or feat not in tss_map:
+    for row in rows:
+        el, reason = build_element(row, fa, chrom_len, ltr_coords, args)
+        key = (row['cls'], reason)
+        outcome[key] = outcome.get(key, 0) + 1
+        if el is None:
             continue
-        
-        u3_s, u3_e, _u3_strand = u3_map[feat]
-        tss_abs = tss_map[feat]
 
-        # Orient sequence
-        seq_raw = str(rec.seq).upper()
-        if strand == '+':
-            seq = seq_raw
-            tss_rel = tss_abs - ltr_s
+        feat, seq, tss_rel = el.feature, el.seq, el.tss_rel
+        mapper = OrientedCoords(el.seq_start, el.seq_end, el.strand)
+
+        if el.zone_hi > el.zone_lo:
+            zone_s_abs, zone_e_abs = mapper.rel_to_abs_interval(el.zone_lo, el.zone_hi - el.zone_lo)
         else:
-            seq = str(Seq(seq_raw).reverse_complement())
-            tss_rel = ltr_e - tss_abs
-        
-        mapper = OrientedCoords(ltr_s, ltr_e, strand)
+            zone_s_abs = zone_e_abs = None
+        u3_s_abs, u3_e_abs = (zone_s_abs, zone_e_abs) if el.anchor_mode == 'U3' else (None, None)
 
-        # U3 interval in oriented coordinates
-        u3_r1 = mapper.abs_to_rel(u3_s)
-        u3_r2 = mapper.abs_to_rel(u3_e)
-        u3_lo, u3_hi = (u3_r1, u3_r2) if u3_r1 <= u3_r2 else (u3_r2, u3_r1)
-
-        # Insert element record
         c.execute('''
-            INSERT OR REPLACE INTO elements 
-            (feature, chrom, ltr_start, ltr_end, strand, u3_start, u3_end, tss_abs, tss_rel, sequence, sequence_length)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (feat, chrom, ltr_s, ltr_e, strand, u3_s, u3_e, tss_abs, tss_rel, seq, len(seq)))
+            INSERT OR REPLACE INTO elements
+            (feature, element_class, orientation, anchor_mode, chrom, seq_start, seq_end, strand,
+             u3_start, u3_end, zone_start, zone_end, tss_abs, tss_rel, total_reads, tss_called,
+             seq_truncated, sequence, sequence_length)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (feat, el.cls, el.orientation, el.anchor_mode, el.chrom, el.seq_start, el.seq_end,
+              el.strand, u3_s_abs, u3_e_abs, zone_s_abs, zone_e_abs, el.tss_abs, tss_rel,
+              el.total_reads, el.tss_called, el.truncated, seq, len(seq)))
 
-        # TA-rich regions (restricted to U3)
+        # TA-rich regions (restricted to U3 or the core band)
         ta_windows = []
-        for s, e, sub in sliding_windows(seq, args.window_size, args.step_size, start=u3_lo, end=u3_hi):
+        for s, e, sub in sliding_windows(seq, args.window_size, args.step_size,
+                                         start=el.zone_lo, end=el.zone_hi):
             if 'N' in sub:
                 continue
             if frac_bases(sub, {'T','A'}) >= args.ta_threshold:
                 ta_windows.append((s, e))
         ta_regions = merge_intervals(ta_windows)
-        
+
         for ta_s, ta_e in ta_regions:
             ta_s_abs, ta_e_abs = mapper.rel_to_abs_interval(ta_s, ta_e - ta_s)
             c.execute('''
@@ -743,23 +966,22 @@ def main():
                 VALUES (?, ?, ?, ?, ?)
             ''', (feat, ta_s, ta_e, ta_s_abs, ta_e_abs))
 
-        # Helper to check if position is in TA region
         def in_ta_region(s_rel: int, e_rel: int) -> bool:
             for a, b in ta_regions:
                 if s_rel >= a and e_rel <= b:
                     return True
             return False
 
-        # CA runs across entire LTR
+        # CA runs across the whole scanned sequence
         ca_runs = find_alternating_ca_runs(seq, min_length=args.ca_min_length)
         for run_start, run_end in ca_runs:
             run_length = run_end - run_start
             p_value = binomial_test_ca_run(run_length, bg['C'], bg['A'])
             total_tests += 1
-            
+
             bonferroni_alpha = args.ca_alpha / max(1, total_tests)
             is_significant = 1 if p_value <= bonferroni_alpha else 0
-            
+
             ca_s_abs, ca_e_abs = mapper.rel_to_abs_interval(run_start, run_length)
             c.execute('''
                 INSERT INTO ca_runs (feature, start_rel, end_rel, start_abs, end_abs, length, p_value, is_significant)
@@ -767,121 +989,46 @@ def main():
             ''', (feat, run_start, run_end, ca_s_abs, ca_e_abs, run_length, p_value, is_significant))
 
         # === MOTIF SCANNING - Store ALL hits ===
-        
-        # 1) Primary TATA upstream
-        up_start = max(0, tss_rel - args.tata_max_dist)
-        #up_end = max(0, tss_rel)
-        up_end = max(0, tss_rel + 8)
-        tata_hits = scan_all_pwm_hits(seq, pwms['TATA'], bg, up_start, up_end, scan_thr['TATA'])
-        for s_rel, e_rel, score, subseq in tata_hits:
-            # p-value under background (TATA PWM)
-            pval = score_to_pvalue(bg_scores['TATA'], score)
-            
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['TATA']))
-            dist = tss_rel - s_rel
-            in_ta = 1 if in_ta_region(s_rel, e_rel) else 0
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits 
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs, 
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'TATA', pwm_len(pwms['TATA']), s_rel, e_rel, s_abs, e_abs, 
-                  score, subseq, dist, in_ta, yc, up_start, up_end, pval))
+        def scan_band(motif, pwm_key, band_start, band_end, dist_fn, use_ta):
+            """Scan one TSS-relative band and store every hit above the scan threshold."""
+            pwm = pwms[pwm_key]
+            L = pwm_len(pwm)
+            for s_rel, e_rel, score, subseq in scan_all_pwm_hits(seq, pwm, bg, band_start,
+                                                                 band_end, scan_thr[motif]):
+                pval = score_to_pvalue(bg_scores[pwm_key], score)
+                s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, L)
+                in_ta = 1 if use_ta and in_ta_region(s_rel, e_rel) else 0
+                yc = sum(1 for b in subseq if b in 'CT')
+                c.execute('''
+                    INSERT INTO motif_hits
+                    (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs,
+                     score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (feat, motif, L, s_rel, e_rel, s_abs, e_abs,
+                      score, subseq, dist_fn(s_rel), in_ta, yc, band_start, band_end, pval))
 
+        upstream = lambda s_rel: tss_rel - s_rel
+        downstream = lambda s_rel: s_rel - tss_rel
+
+        # 1) Primary TATA upstream (band extends 8 bp past TSS)
+        scan_band('TATA', 'TATA', max(0, tss_rel - args.tata_max_dist), max(0, tss_rel + 8),
+                  upstream, True)
         # 2) CCAAT-box upstream 460-140 bp
-        cca_band_start = max(0, tss_rel - 460)
-        cca_band_end = max(0, tss_rel - 140)
-        ccaat_hits = scan_all_pwm_hits(seq, pwms['CCAAT'], bg, cca_band_start, cca_band_end, scan_thr['CCAAT'])
-        for s_rel, e_rel, score, subseq in ccaat_hits:
-            # p-value under background (CCAAT PWM)
-            pval = score_to_pvalue(bg_scores['CCAAT'], score)
-            
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['CCAAT']))
-            dist = tss_rel - s_rel
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits 
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs, 
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'CCAAT', pwm_len(pwms['CCAAT']), s_rel, e_rel, s_abs, e_abs, 
-                  score, subseq, dist, 0, yc, cca_band_start, cca_band_end, pval))
-
-        # 3) Y-PATCH upstream 100–1 bp, 8-mer
-        yp_start = max(0, tss_rel - 100)
-        yp_end   = max(0, tss_rel)
-        ypatch_hits = scan_all_pwm_hits(seq, pwms['YPATCH'], bg, yp_start, yp_end, scan_thr['YPATCH'])
-        for s_rel, e_rel, score, subseq in ypatch_hits:
-            pval = score_to_pvalue(bg_scores['YPATCH'], score)
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['YPATCH']))
-            dist = tss_rel - s_rel
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs,
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'YPATCH', 8, s_rel, e_rel, s_abs, e_abs,
-                  score, subseq, dist, 0, yc, yp_start, yp_end, pval))
-
+        scan_band('CCAAT', 'CCAAT', max(0, tss_rel - 460), max(0, tss_rel - 140), upstream, False)
+        # 3) Y-PATCH upstream 100-1 bp, 8-mer
+        scan_band('YPATCH', 'YPATCH', max(0, tss_rel - 100), max(0, tss_rel), upstream, False)
         # 4) Inr motif near TSS
-        inr_band_start = max(0, tss_rel - args.inr_max_dist)
-        inr_band_end = min(len(seq), tss_rel + args.inr_max_dist + 1)
-        inr_hits = scan_all_pwm_hits(seq, pwms['INR7'], bg, inr_band_start, inr_band_end, scan_thr['INR7'])
-        for s_rel, e_rel, score, subseq in inr_hits:
-            # p-value under background (INR PWM)
-            pval = score_to_pvalue(bg_scores['INR7'], score)
-            
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['INR7']))
-            dist = abs(s_rel - tss_rel)
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits 
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs, 
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'INR7', pwm_len(pwms['INR7']), s_rel, e_rel, s_abs, e_abs, 
-                  score, subseq, dist, 0, yc, inr_band_start, inr_band_end, pval))
-
-        # 5) Secondary TATA -120 bp downstream
-        sec_band_start = tss_rel + 1
-        sec_band_end = min(len(seq), tss_rel + 120)
-        sec_tata_hits = scan_all_pwm_hits(seq, pwms['TATA'], bg, sec_band_start, sec_band_end, scan_thr['SEC_TATA'])
-        for s_rel, e_rel, score, subseq in sec_tata_hits:
-            # p-value under background (TATA PWM)
-            pval = score_to_pvalue(bg_scores['TATA'], score)
-            
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['TATA']))
-            dist = s_rel - tss_rel
-            in_ta = 1 if in_ta_region(s_rel, e_rel) else 0
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits 
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs, 
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'SEC_TATA', pwm_len(pwms['TATA']), s_rel, e_rel, s_abs, e_abs, 
-                  score, subseq, dist, in_ta, yc, sec_band_start, sec_band_end, pval))
-
+        scan_band('INR7', 'INR7', max(0, tss_rel - args.inr_max_dist),
+                  min(len(seq), tss_rel + args.inr_max_dist + 1),
+                  lambda s_rel: abs(s_rel - tss_rel), False)
+        # 5) Secondary TATA up to 120 bp downstream
+        scan_band('SEC_TATA', 'TATA', tss_rel + 1, min(len(seq), tss_rel + 120), downstream, True)
         # 6) DPE motif 0-50 bp downstream
-        dpe_band_start = tss_rel
-        dpe_band_end = min(len(seq), tss_rel + 50)
-        dpe_hits = scan_all_pwm_hits(seq, pwms['DPE7'], bg, dpe_band_start, dpe_band_end, scan_thr['DPE7'])
-        for s_rel, e_rel, score, subseq in dpe_hits:
-            # p-value under background (DPE PWM)
-            pval = score_to_pvalue(bg_scores['DPE7'], score)
-            
-            s_abs, e_abs = mapper.rel_to_abs_interval(s_rel, pwm_len(pwms['DPE7']))
-            dist = s_rel - tss_rel
-            yc = sum(1 for b in subseq if b in 'CT')
-            c.execute('''
-                INSERT INTO motif_hits 
-                (feature, motif_type, motif_length, start_rel, end_rel, start_abs, end_abs, 
-                 score, sequence, dist_to_tss, in_ta_region, y_count, search_window_start, search_window_end, p_value)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (feat, 'DPE7', pwm_len(pwms['DPE7']), s_rel, e_rel, s_abs, e_abs, 
-                  score, subseq, dist, 0, yc, dpe_band_start, dpe_band_end, pval))
+        scan_band('DPE7', 'DPE7', tss_rel, min(len(seq), tss_rel + 50), downstream, False)
+
+    fa.close()
+    for (cls, reason), n in sorted(outcome.items()):
+        logging.info(f"  {cls:15s} {reason:28s} {n}")
 
     def compute_and_store_percentile_cutoffs(conn, perc: float):
         cur = conn.cursor()
@@ -899,7 +1046,7 @@ def main():
 
     compute_and_store_percentile_cutoffs(conn, args.percentile_cut)
     conn.close()
-    
+
     logging.info(f"Database written to {args.database}")
     logging.info(f"Total statistical tests for CA runs: {total_tests}")
     logging.info("Use Query_WSDB.py to analyze results with flexible filtering")
