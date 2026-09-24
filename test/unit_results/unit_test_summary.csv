@@ -1,0 +1,66 @@
+"file","test","nb","failed","skipped","error","warning"
+"test-io-presets.R","parse_options splits key=value pairs and types the values",3,0,FALSE,FALSE,0
+"test-io-presets.R","parse_options turns comma lists into vectors",1,0,FALSE,FALSE,0
+"test-io-presets.R","parse_options keeps '=' inside a value",1,0,FALSE,FALSE,0
+"test-io-presets.R","parse_options returns an empty list for blank input",2,0,FALSE,FALSE,0
+"test-io-presets.R","parse_options rejects a malformed pair",1,0,FALSE,FALSE,0
+"test-io-presets.R","pick_col resolves by name, by index, and by candidate list",4,0,FALSE,FALSE,0
+"test-io-presets.R","pick_col errors informatively when the column is absent",2,0,FALSE,FALSE,0
+"test-io-presets.R","apply_filter keeps == matches and drops NA rows",2,0,FALSE,FALSE,0
+"test-io-presets.R","apply_filter is a no-op without an expression",1,0,FALSE,FALSE,0
+"test-io-presets.R","apply_filter rejects an unparseable expression",1,0,FALSE,FALSE,0
+"test-io-presets.R","read_reference_gff keeps only the requested feature types",2,0,FALSE,FALSE,0
+"test-io-presets.R","read_reference_gff expands attributes and honours drop_attributes",4,0,FALSE,FALSE,0
+"test-io-presets.R","read_reference_gff keeps coordinate-sharing features apart by default",1,0,FALSE,FALSE,0
+"test-io-presets.R","legacy_collapse merges coordinate-sharing features into one row",2,0,FALSE,FALSE,0
+"test-io-presets.R","build_keymap resolves both the feature ID and its Parent",3,0,FALSE,FALSE,0
+"test-io-presets.R","intersect_gff_chip reads column 14 and takes the maximum per feature",3,0,FALSE,FALSE,0
+"test-io-presets.R","intersect_gff_chip defaults to a fill of 0",1,0,FALSE,FALSE,0
+"test-io-presets.R","intersect_gff_umr reads column 16 and takes the first value per feature",1,0,FALSE,FALSE,0
+"test-io-presets.R","intersect_gff_umr defaults to a fill of 100 (no data, not zero methylation)",1,0,FALSE,FALSE,0
+"test-io-presets.R","count_matrix selects the sample's column and sums duplicate rows",2,0,FALSE,FALSE,0
+"test-io-presets.R","count_matrix reads a different sample from the same file",2,0,FALSE,FALSE,0
+"test-io-presets.R","count_matrix errors when the named column is absent",1,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v1 keys a gene table on 'Gene' and scores Total_Reads",2,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v1 resolves an LTR table keyed on the Parent id",3,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v1 carries the TSS columns through as extras",2,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v2 keeps only sense rows",2,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v2 resolves genes and structural LTR-RTs from one file",2,0,FALSE,FALSE,0
+"test-io-presets.R","tss_summary_v2 carries Class through as an extra",1,0,FALSE,FALSE,0
+"test-io-presets.R","isoforms_v1 keys on Parent= inside the attrs column",3,0,FALSE,FALSE,0
+"test-io-presets.R","isoforms_v2 keeps every column but the structural ones",2,0,FALSE,FALSE,0
+"test-io-presets.R","motif_tsv reads *_present flags written as 1/0 as logicals",3,0,FALSE,FALSE,0
+"test-io-presets.R","motif_tsv keeps numeric motif distances numeric",1,0,FALSE,FALSE,0
+"test-io-presets.R","keyed_tsv scores column 2 keyed on column 1",1,0,FALSE,FALSE,0
+"test-io-presets.R","keyed_tsv with keep_cols=* returns every non-key column as extras",1,0,FALSE,FALSE,0
+"test-io-presets.R","manifest options override the preset defaults",3,0,FALSE,FALSE,0
+"test-io-presets.R","keep_cols naming an absent column is an error, not a silent drop",1,0,FALSE,FALSE,0
+"test-io-presets.R","read_keyed_table reports how many keys resolved to a feature",2,0,FALSE,FALSE,0
+"test-io-presets.R","read_keyed_table errors on a missing file",1,0,FALSE,FALSE,0
+"test-io-presets.R","read_manifest derives a row_id that includes the scope when it narrows the file",1,0,FALSE,FALSE,0
+"test-io-presets.R","read_manifest rejects an unknown preset, role, or scope",3,0,FALSE,FALSE,0
+"test-io-presets.R","read_manifest rejects two score rows that would claim the same assay column",1,0,FALSE,FALSE,0
+"test-io-presets.R","read_manifest allows extras rows to share a row_id with a score row",1,0,FALSE,FALSE,0
+"test-model-summing.R","per_sample merges the gene and LTR tables of one sample into one column",4,0,FALSE,FALSE,0
+"test-model-summing.R","per_row keeps one column per manifest row (pre-refactor behaviour)",4,0,FALSE,FALSE,0
+"test-model-summing.R","build_model rejects an unknown assay_columns setting",1,0,FALSE,FALSE,0
+"test-model-summing.R","zero-fill score rows of one sample are summed",2,0,FALSE,FALSE,0
+"test-model-summing.R","non-zero-fill rows covering disjoint features take the non-fill value",3,0,FALSE,FALSE,0
+"test-model-summing.R","non-zero-fill rows overlapping on a feature are refused",1,0,FALSE,FALSE,0
+"test-model-summing.R","score rows of one sample declaring different fills are refused",1,0,FALSE,FALSE,0
+"test-model-summing.R","features absent from every input keep the preset fill",1,0,FALSE,FALSE,0
+"test-model-summing.R","unit_label groups a sample by platform, tissue and replicate",1,0,FALSE,FALSE,0
+"test-model-summing.R","assay_rowsums totals only the named columns",1,0,FALSE,FALSE,0
+"test-model-summing.R","assay_rowsums treats NA and Inf as zero",1,0,FALSE,FALSE,0
+"test-model-summing.R","filter_features drops the same rows from features and every assay",4,0,FALSE,FALSE,0
+"test-model-summing.R","filter_features is a no-op without a regex",1,0,FALSE,FALSE,0
+"test-model-summing.R","member_columns matches by tissue and by a tissue/replicate pair",3,0,FALSE,FALSE,0
+"test-model-summing.R","resolve_groups follows an explicit config",3,0,FALSE,FALSE,0
+"test-model-summing.R","resolve_groups falls back to one group per tissue per platform",2,0,FALSE,FALSE,0
+"test-model-summing.R","resolve_groups ignores platforms with no scoring weight",2,0,FALSE,FALSE,0
+"test-model-summing.R","model_to_wide emits one column per assay column plus the extras",3,0,FALSE,FALSE,0
+"test-model-summing.R","model_to_wide fills missing extras with 0 and FALSE when asked",2,0,FALSE,FALSE,0
+"test-model-summing.R","model_to_wide leaves missing extras as NA when fill is off",1,0,FALSE,FALSE,0
+"test-model-summing.R","model_to_wide disambiguates fields two extras blocks share",3,0,FALSE,FALSE,0
+"test-model-summing.R","build_model records the key resolution rate per file",2,0,FALSE,FALSE,0
+"test-model-summing.R","unresolvable keys are counted, not silently dropped",3,0,FALSE,FALSE,0

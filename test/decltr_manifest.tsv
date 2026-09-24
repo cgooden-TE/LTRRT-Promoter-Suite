@@ -1,0 +1,3 @@
+sample_id	platform	role	preset	path	column	tissue	replicate	scope	options
+ONT_test	ont	score	tss_summary_v2	output/test_ltr_isoforms_sense.tss_summary.tsv		Leaf	1	both	
+ONT_test	ont	extra	isoforms_v2	output/test_ltr_isoforms_sense.isoforms.tsv		Leaf	1	both	

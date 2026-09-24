@@ -1,0 +1,11 @@
+# DECLTR config for the test dataset: one ONT sample, no Illumina/ChIP/UMR.
+reference_gff: test_annotations.gff
+feature_types: ["^gene$", "LTR_retrotransposon"]
+drop_contigs_regex: "scaf"
+drop_attributes: [motif, tsd, TSD, TIR, biotype, logic_name, Sequence_ontology]
+# No `groups`: one group per tissue per platform is derived from the manifest.
+veg_groups: [Leaf]
+scoring:
+  weights: {ont: 0.7}
+  s: 0.25
+output_prefix: output/decltr_test

@@ -72,7 +72,7 @@ python3 "$SUITE_DIR/IsoClassifier.py" \
     --genome-fasta "$SCRIPT_DIR/test_reference.fa"
 
 # Verify key outputs exist
-if [ ! -f "$OUT_DIR/test_ltr_isoforms.tsv" ]; then
+if [ ! -f "$OUT_DIR/test_ltr_isoforms_sense.isoforms.tsv" ]; then
     echo "ERROR: IsoClassifier did not produce expected isoform output."
     exit 1
 fi
@@ -81,8 +81,8 @@ fi
 for f in test_ltr_isoforms_gene_2kb_proms.bed \
          test_ltr_isoforms_gene_2kb_proms.fa \
          test_ltr_isoforms_gene_dummy_u3.fa \
-         test_ltr_isoforms_u3_seqs.fa \
-         test_ltr_isoforms_ltr_seqs.fa; do
+         test_ltr_isoforms_u3_seqs_sense.fa \
+         test_ltr_isoforms_ltr_seqs_sense.fa; do
     if [ ! -f "$OUT_DIR/$f" ]; then
         echo "WARNING: U3/promoter output $f not found (may be empty if no reads classified)."
     fi
@@ -93,80 +93,98 @@ echo ""
 # -------------------------------------------------------
 # Step 3: WindowScrubber
 # -------------------------------------------------------
-# WindowScrubber is run twice against the IsoClassifier outputs:
-#   - LTR-RT elements  (u3_seqs.fa / ltr_seqs.fa / ltr_tss_summary.tsv)
-#   - Gene promoters   (gene_dummy_u3.fa / gene_2kb_proms.fa / gene_summary.tsv)
+# One run covers every element class. LTR_structural elements whose TSS sits in an
+# LTR use the U3 schema (LTR bounds from ltr_seqs_sense.fa); genes, DNA TEs, LINE/SINE
+# and LTR fragments use a fixed genome window around the TSS.
 echo "---------------------------------------------"
-echo " Step 3: WindowScrubber (LTR-RTs)"
-echo "---------------------------------------------"
-python3 "$SUITE_DIR/WindowScrubber.py" \
-    -l "$OUT_DIR/test_ltr_isoforms_ltr_seqs.fa" \
-    -u3 "$OUT_DIR/test_ltr_isoforms_u3_seqs.fa" \
-    -t "$OUT_DIR/test_ltr_tss_summary.tsv" \
-    -db "$OUT_DIR/test_ltr_motif_hits.db"
-
-if [ ! -s "$OUT_DIR/test_ltr_motif_hits.db" ]; then
-    echo "ERROR: WindowScrubber did not produce LTR motif database."
-    exit 1
-fi
-echo "WindowScrubber (LTR-RTs) completed successfully."
-echo ""
-
-echo "---------------------------------------------"
-echo " Step 3b: WindowScrubber (Genes)"
+echo " Step 3: WindowScrubber"
 echo "---------------------------------------------"
 python3 "$SUITE_DIR/WindowScrubber.py" \
-    -l "$OUT_DIR/test_ltr_isoforms_gene_2kb_proms.fa" \
-    -u3 "$OUT_DIR/test_ltr_isoforms_gene_dummy_u3.fa" \
-    -t "$OUT_DIR/test_gene_summary.tsv" \
-    -db "$OUT_DIR/test_gene_motif_hits.db"
+    -t "$OUT_DIR/test_ltr_isoforms_sense.tss_summary.tsv" \
+    -g "$SCRIPT_DIR/test_reference.fa" \
+    -l "$OUT_DIR/test_ltr_isoforms_ltr_seqs_sense.fa" \
+    -db "$OUT_DIR/test_motif_hits.db"
 
-if [ ! -s "$OUT_DIR/test_gene_motif_hits.db" ]; then
-    echo "ERROR: WindowScrubber did not produce gene motif database."
+if [ ! -s "$OUT_DIR/test_motif_hits.db" ]; then
+    echo "ERROR: WindowScrubber did not produce a motif database."
     exit 1
 fi
-echo "WindowScrubber (Genes) completed successfully."
+echo "WindowScrubber completed successfully."
 echo ""
 
 # -------------------------------------------------------
-# Step 4: Query_WSDB (run against both LTR and gene databases)
+# Step 4: Query_WSDB
 # -------------------------------------------------------
 echo "---------------------------------------------"
 echo " Step 4: Query_WSDB"
 echo "---------------------------------------------"
+DB="$OUT_DIR/test_motif_hits.db"
 
-for TAG in ltr gene; do
-    DB="$OUT_DIR/test_${TAG}_motif_hits.db"
-    echo ""
-    echo "== Query_WSDB against $TAG database =="
+echo "  4a. Database statistics:"
+python3 "$SUITE_DIR/Query_WSDB.py" -db "$DB" --stats
 
-    echo "  4a. Database statistics:"
-    python3 "$SUITE_DIR/Query_WSDB.py" -db "$DB" --stats
+echo ""
+echo "  4b. Best TATA per element:"
+python3 "$SUITE_DIR/Query_WSDB.py" \
+    -db "$DB" \
+    --best-per-element TATA \
+    --order-by score \
+    -o "$OUT_DIR/test_best_tata.tsv"
 
-    echo ""
-    echo "  4b. Best TATA per element:"
-    python3 "$SUITE_DIR/Query_WSDB.py" \
-        -db "$DB" \
-        --best-per-element TATA \
-        --order-by score \
-        -o "$OUT_DIR/test_${TAG}_best_tata.tsv"
-
-    echo ""
-    echo "  4c. Best hits for all motifs (wide format):"
+echo ""
+echo "  4c. Best hits for all motifs (wide format), per schema:"
+for MODE in U3 TSS_window; do
     python3 "$SUITE_DIR/Query_WSDB.py" \
         -db "$DB" \
         --best-all-motifs \
-        -o "$OUT_DIR/test_${TAG}_best_all_motifs.tsv"
-
-    echo ""
-    echo "  4d. CA dinucleotide summary:"
-    python3 "$SUITE_DIR/Query_WSDB.py" \
-        -db "$DB" \
-        --ca-summary \
-        -o "$OUT_DIR/test_${TAG}_ca_runs.tsv"
+        --anchor-mode "$MODE" \
+        -o "$OUT_DIR/test_${MODE}_best_all_motifs.tsv"
 done
 
+echo ""
+echo "  4d. Best TATA for genes only:"
+python3 "$SUITE_DIR/Query_WSDB.py" \
+    -db "$DB" \
+    --best-per-element TATA \
+    --class Gene \
+    -o "$OUT_DIR/test_gene_best_tata.tsv"
+
+echo ""
+echo "  4e. CA dinucleotide summary:"
+python3 "$SUITE_DIR/Query_WSDB.py" \
+    -db "$DB" \
+    --ca-summary \
+    -o "$OUT_DIR/test_ca_runs.tsv"
+
 echo "Query_WSDB completed successfully."
+echo ""
+
+# -------------------------------------------------------
+# Step 5: DECLTR (needs the DECLTR-env R environment)
+# -------------------------------------------------------
+# Runs on the IsoClassifier v2 outputs with a two-row manifest and no
+# Illumina/ChIP/UMR inputs, so every platform is exercised as optional.
+# Set DECLTR_RSCRIPT to the Rscript of the DECLTR-env if it is not on PATH.
+echo "---------------------------------------------"
+echo " Step 5: DECLTR"
+echo "---------------------------------------------"
+RSCRIPT="${DECLTR_RSCRIPT:-Rscript}"
+if "$RSCRIPT" -e 'suppressMessages({library(qs); library(segmented); library(yaml); library(data.table)})' >/dev/null 2>&1; then
+    "$RSCRIPT" "$SUITE_DIR/DECLTR.r" \
+        --manifest "$SCRIPT_DIR/decltr_manifest.tsv" \
+        --config "$SCRIPT_DIR/decltr_config.yml" \
+        --validate
+    "$RSCRIPT" "$SUITE_DIR/DECLTR.r" \
+        --manifest "$SCRIPT_DIR/decltr_manifest.tsv" \
+        --config "$SCRIPT_DIR/decltr_config.yml"
+    if [ ! -s "$OUT_DIR/decltr_test_labels.tsv" ] || [ "$(wc -l < "$OUT_DIR/decltr_test_labels.tsv")" -lt 2 ]; then
+        echo "ERROR: DECLTR did not produce a labels table."
+        exit 1
+    fi
+    echo "DECLTR completed successfully."
+else
+    echo "WARNING: R with qs/segmented/yaml/data.table not found; skipping DECLTR (set DECLTR_RSCRIPT)."
+fi
 echo ""
 
 # -------------------------------------------------------
