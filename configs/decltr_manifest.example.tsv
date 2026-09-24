@@ -1,0 +1,68 @@
+sample_id	platform	role	preset	path	column	tissue	replicate	scope	options
+Ears_H3K27ac.1	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Ears_H3K27ac.1_peaks.intsct.gff		Ears	1	both	
+Ears_H3K27ac.2	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Ears_H3K27ac.2_peaks.intsct.gff		Ears	2	both	
+Ears_H3K4me3.1	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Ears_H3K4me3.1_peaks.intsct.gff		Ears	1	both	
+Ears_H3K4me3.2	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Ears_H3K4me3.2_peaks.intsct.gff		Ears	2	both	
+Shoots_H3K27ac.1	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Shoots_H3K27ac.1_peaks.intsct.gff		Shoots	1	both	
+Shoots_H3K27ac.2	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Shoots_H3K27ac.2_peaks.intsct.gff		Shoots	2	both	
+Shoots_H3K4me3.1	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Shoots_H3K4me3.1_peaks.intsct.gff		Shoots	1	both	
+Shoots_H3K4me3.2	chip	score	intersect_gff_chip	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/Shoots_H3K4me3.2_peaks.intsct.gff		Shoots	2	both	
+TEs_Genes_UMR	umr	score	intersect_gff_umr	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/GenomicData/TEs_Genes_UMR_intsct.gff				both	
+ONT_CT1	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT1_Mar_PycStr_rerun_0310_isoforms_Gene_TSS.tsv		Leaf	CT1	gene	
+ONT_CT1	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT1_Mar_PycStr_rerun_0310_isoforms_LTR_TSS.tsv		Leaf	CT1	te	
+ONT_CT1	ont	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT1_Mar_PycStr_rerun_0310_isoforms.tsv		Leaf	CT1	te	
+ONT_CT2	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT2_Mar_PycStr_rerun_0310_isoforms_Gene_TSS.tsv		Leaf	CT2	gene	
+ONT_CT2	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT2_Mar_PycStr_rerun_0310_isoforms_LTR_TSS.tsv		Leaf	CT2	te	
+ONT_CT2	ont	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT2_Mar_PycStr_rerun_0310_isoforms.tsv		Leaf	CT2	te	
+ONT_CT3	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT3_Mar_PycStr_rerun_0310_isoforms_Gene_TSS.tsv		Leaf	CT3	gene	
+ONT_CT3	ont	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT3_Mar_PycStr_rerun_0310_isoforms_LTR_TSS.tsv		Leaf	CT3	te	
+ONT_CT3	ont	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CT3_Mar_PycStr_rerun_0310_isoforms.tsv		Leaf	CT3	te	
+ONT_CTMerge	ont	extra	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CTMerge_Mar_PycStr_Rerun_0310_Gene_TSS.tsv				gene	keep_cols=Total_Reads,TSS1,Count1,TSS2,Count2
+ONT_CTMerge	ont	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CTMerge_Mar_PycStr_Rerun_0310_isoforms.tsv				te	
+ONT_CTMerge	ont	extra	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONT_CTMerge_Mar_PycStr_Rerun_0310_LTR_TSS.tsv				te	keep_cols=Total_Reads,TSS1,Count1,TSS2,Count2
+ONTPB	ont	extra	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONTPB_Mar_PycStr_rerun_0310_Gene_TSS.tsv				gene	keep_cols=Total_Reads,TSS1,Count1,TSS2,Count2
+ONTPB	ont	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONTPB_Mar_PycStr_rerun_0310_isoforms.tsv				te	
+ONTPB	ont	extra	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/ONTPB_Mar_PycStr_rerun_0310_LTR_TSS.tsv				te	keep_cols=Total_Reads,TSS1,Count1,TSS2,Count2
+PB_Ear	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Ear_PycStr_rerun_0309_Gene_TSS.tsv		Ear		gene	
+PB_Ear	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Ear_PycStr_rerun_0309_isoforms.tsv		Ear		te	
+PB_Ear	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Ear_PycStr_rerun_0309_LTR_TSS.tsv		Ear		te	
+PB_Embryo	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Embryo_PycStr_rerun_0309_Gene_TSS.tsv		Embryo		gene	
+PB_Embryo	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Embryo_PycStr_rerun_0309_isoforms.tsv		Embryo		te	
+PB_Embryo	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Embryo_PycStr_rerun_0309_LTR_TSS.tsv		Embryo		te	
+PB_Endosperm	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Endosperm_PycStr_rerun_0309_Gene_TSS.tsv		Endosperm		gene	
+PB_Endosperm	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Endosperm_PycStr_rerun_0309_isoforms.tsv		Endosperm		te	
+PB_Endosperm	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Endosperm_PycStr_rerun_0309_LTR_TSS.tsv		Endosperm		te	
+PB_Pollen	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Pollen_PycStr_rerun_0309_Gene_TSS.tsv		Pollen		gene	
+PB_Pollen	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Pollen_PycStr_rerun_0309_isoforms.tsv		Pollen		te	
+PB_Pollen	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Pollen_PycStr_rerun_0309_LTR_TSS.tsv		Pollen		te	
+PB_Root	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Root_PycStr_rerun_0309_Gene_TSS.tsv		Root		gene	
+PB_Root	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Root_PycStr_rerun_0309_isoforms.tsv		Root		te	
+PB_Root	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Root_PycStr_rerun_0309_LTR_TSS.tsv		Root		te	
+PB_Tassel	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Tassel_PycStr_rerun_0309_Gene_TSS.tsv		Tassel		gene	
+PB_Tassel	pacbio	extra	isoforms_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Tassel_PycStr_rerun_0309_isoforms.tsv		Tassel		te	
+PB_Tassel	pacbio	score	tss_summary_v1	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/IsoformData/PB_Tassel_PycStr_rerun_0309_LTR_TSS.tsv		Tassel		te	
+ONTPB	motif	extra	motif_tsv	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/MotifData/ONTPB_NAM-rerun_LTR_motifs.tsv				te	
+ONTPB	motif	extra	motif_tsv	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/DECLTR/MotifData/ONTPB_samtools-debug_Gene_motifs.tsv				gene	
+Root	cage	extra	keyed_tsv	/data/caleb/ToolScripts/Github/LTRRT-Promoter-Suite/results/inputs_std/Root_cage.tsv		Root		both	keep_cols=*
+Shoot	cage	extra	keyed_tsv	/data/caleb/ToolScripts/Github/LTRRT-Promoter-Suite/results/inputs_std/Shoot_cage.tsv		Shoot		both	keep_cols=*
+B73NAM_16DAP_Embryo_MN01101	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_16DAP_Embryo_MN01101	Embryo	MN01101	both	
+B73NAM_16DAP_Embryo_MN01102	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_16DAP_Embryo_MN01102	Embryo	MN01102	both	
+B73NAM_16DAP_Endosperm_MN01091	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_16DAP_Endosperm_MN01091	Endosperm	MN01091	both	
+B73NAM_16DAP_Endosperm_MN01092	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_16DAP_Endosperm_MN01092	Endosperm	MN01092	both	
+B73NAM_6DAP_Root_MN01011	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_6DAP_Root_MN01011	Root	MN01011	both	
+B73NAM_6DAP_Root_MN01012	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_6DAP_Root_MN01012	Root	MN01012	both	
+B73NAM_6DAP_Shoot_MN01021	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_6DAP_Shoot_MN01021	Shoot	MN01021	both	
+B73NAM_6DAP_Shoot_MN01022	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_6DAP_Shoot_MN01022	Shoot	MN01022	both	
+B73NAM_R1_Anther_MN01081	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_R1_Anther_MN01081	Anther	MN01081	both	
+B73NAM_R1_Anther_MN01082	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_R1_Anther_MN01082	Anther	MN01082	both	
+B73NAM_V11_Base_MN01031	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Base_MN01031	V11_Base	MN01031	both	
+B73NAM_V11_Base_MN01032	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Base_MN01032	V11_Base	MN01032	both	
+B73NAM_V11_Middle_MN01041	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Middle_MN01041	V11_Middle	MN01041	both	
+B73NAM_V11_Middle_MN01042	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Middle_MN01042	V11_Middle	MN01042	both	
+B73NAM_V11_Middle_MN01043	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Middle_MN01043	V11_Middle	MN01043	both	
+B73NAM_V11_Tip_MN01051	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Tip_MN01051	V11_Tip	MN01051	both	
+B73NAM_V11_Tip_MN01052	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V11_Tip_MN01052	V11_Tip	MN01052	both	
+B73NAM_V18_Ear_MN01071	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V18_Ear_MN01071	Ear	MN01071	both	
+B73NAM_V18_Ear_MN01072	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V18_Ear_MN01072	Ear	MN01072	both	
+B73NAM_V18_Tassel_MN01061	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V18_Tassel_MN01061	Tassel	MN01061	both	
+B73NAM_V18_Tassel_MN01062	illumina	score	count_matrix	/data/caleb/PaperWritingReruns/LTRRT_PromSuite/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv	B73NAM_V18_Tassel_MN01062	Tassel	MN01062	both	

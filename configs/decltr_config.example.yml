@@ -1,0 +1,74 @@
+# DECLTR run configuration (example mirroring the maize B73 analysis).
+# Paths may be absolute or relative to this file.
+
+reference_gff: /data/caleb/genome_and_annotations/TE_B73_UpdatedStrands_wGenes.gff
+
+# Regexes matched against GFF column 3; features of any matching type are loaded.
+feature_types: ["^gene$", "LTR_retrotransposon"]
+
+# Features on contigs matching this regex (case-insensitive) are dropped before thresholding.
+drop_contigs_regex: "scaf"
+
+# GFF attributes not carried into the output.
+drop_attributes: [motif, tsd, TSD, TIR, biotype, logic_name, Sequence_ontology]
+
+# Tissue groups used for scoring. Each group lists, per expression platform, which
+# manifest samples belong to it. A member is a tissue name or a map with any of
+# tissue / replicate / sample_id. Omit `groups` to get one group per tissue per platform.
+groups:
+  Embryo:     {illumina: [Embryo],     pacbio: [Embryo]}
+  Endosperm:  {illumina: [Endosperm],  pacbio: [Endosperm]}
+  Root:       {illumina: [Root],       pacbio: [Root]}
+  Shoot:      {illumina: [Shoot]}
+  V11_Base:   {illumina: [V11_Base]}
+  V11_Middle: {illumina: [V11_Middle]}
+  V11_Tip:    {illumina: [V11_Tip]}
+  Ear:        {illumina: [Ear],        pacbio: [Ear]}
+  Tassel:     {illumina: [Tassel],     pacbio: [Tassel]}
+  Anther:     {illumina: [Anther]}
+  Pollen:     {pacbio: [Pollen]}
+  Leaf:       {illumina: [V11_Base, V11_Middle, V11_Tip], ont: [Leaf]}
+  ONT_CT1:    {ont: [{tissue: Leaf, replicate: CT1}]}
+  ONT_CT2:    {ont: [{tissue: Leaf, replicate: CT2}]}
+  ONT_CT3:    {ont: [{tissue: Leaf, replicate: CT3}]}
+
+# Group -> label-level tissue. Groups sharing an alias are collapsed (max) before labeling.
+aliases:
+  V11_Base: Leaf
+  V11_Middle: Leaf
+  V11_Tip: Leaf
+  ONT_CT1: Leaf
+  ONT_CT2: Leaf
+  ONT_CT3: Leaf
+
+dev_groups: [Embryo, Endosperm, Anther, Pollen]
+veg_groups: [Leaf, Root, Ear, Tassel]
+
+scoring:
+  weights: {illumina: 1.0, pacbio: 1.0, ont: 0.7}   # platforms scored = keys listed here
+  s: 0.25                                            # sigmoid scale on log1p delta
+
+labels:
+  active_thr: 0.75
+  weak_thr: 0.45
+  silent_thr: 0.30
+  repress_thr: 0.35
+  const_frac: 0.50
+  dom_margin: 0.12
+  min_facultative: 2
+  dev_veg_gap: 0.12
+  veg_cap: 0.55
+  veg_dev_gap: 0.12
+  dev_cap: 0.55
+
+thresholds:
+  default_max_k: 20       # segmented-regression search range for expression units
+  chip_max_k: 50          # ...and for ChIP columns
+  umr_min_signal: 0.1     # 1 - meth/100 at or above this counts as unmethylated support
+  seed: 1
+  pass_by: {ont: unit}    # 'unit': pass if any replicate unit clears its threshold; default 'total'
+
+# Fill NA extras with 0 (numeric) / FALSE (logical) in the output, as before.
+extras_fill: true
+
+output_prefix: ../results/decltr_b73

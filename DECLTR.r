@@ -1,1205 +1,195 @@
 #!/usr/bin/env Rscript
+#
+# Multi-omic integration and activity classification for transposable elements and genes.
+#
+# Merges expression evidence from any number of Illumina, PacBio, and ONT samples with
+# ChIP-seq peaks, DNA methylation (UMR), CAGE, and promoter-motif tables onto one reference
+# annotation, estimates a per-sample expression threshold by segmented regression, fuses the
+# evidence per tissue group, and assigns an activity label to every locus that clears at
+# least one filter. Genes and TEs are scored by the same rules; the element class is carried
+# through for interpretation but never used to branch.
+#
+# Nothing about file names or column names is assumed by the code. Which files exist, what
+# each one contains, and which sample it belongs to are declared in a manifest; the biology
+# (which samples form a tissue, which tissues are developmental) lives in a config.
+#
+# Feature model
+# -------------
+# Features come from the reference GFF, filtered by `feature_types` regexes on column 3.
+# Input files may key on either a feature's ID or its Parent, because IsoClassifier and
+# WindowScrubber report structural LTR-RTs under the EDTA Parent (repeat_region_N) while the
+# annotation and read-count tables use the element ID (LTRRT_N). Both resolve to one locus.
+#
+# Scoring
+# -------
+# 1. Threshold units. Score rows sharing platform, tissue and replicate are summed, and a
+#    segmented regression of loci-remaining against count threshold gives that unit's
+#    breakpoint. Reported in <prefix>_breakpoints.csv.
+# 2. Candidate filter. A locus is scored if its log1p total on any expression platform
+#    clears that platform's breakpoint, or any ChIP column clears its own, or its
+#    unmethylated signal reaches `umr_min_signal`. Everything else is left unlabelled.
+# 3. Group evidence. Per tissue group and platform, the row median of log1p member columns
+#    minus log1p of the group threshold passes through a sigmoid; platforms are then fused
+#    by a weighted mean, skipping platforms with no data at that locus.
+# 4. Labels. Groups are collapsed through `aliases`, then breadth of activity, dominance
+#    margin, and the developmental-versus-vegetative means assign the label. Chromatin
+#    support promotes weak-but-open loci to Repressed.
+#
+# Minimum inputs:
+#     --manifest, TSV declaring one row per sample-file pairing (columns below)
+#     --config, YAML declaring the reference GFF, tissue groups, and scoring parameters
+#     --out, Output prefix (optional; falls back to output_prefix in the config)
+#     --threads, data.table threads, default 1
+#     --validate, Check inputs and exit without scoring
+#
+# Manifest columns (all required, blank where not applicable):
+#     sample_id  : sample label used in output column names
+#     platform   : illumina, pacbio, ont, chip, umr, cage, motif (free text; the expression
+#                  platforms are whichever are listed under scoring.weights in the config)
+#     role       : score (feeds the assay matrix) or extra (carried to the output only)
+#     preset     : reader preset, one of intersect_gff_chip, intersect_gff_umr,
+#                  count_matrix, tss_summary_v1, tss_summary_v2, isoforms_v1, isoforms_v2,
+#                  motif_tsv, keyed_tsv
+#     path       : input file, absolute or relative to the manifest
+#     column     : for count_matrix, which column holds this sample
+#     tissue     : tissue label used to build groups
+#     replicate  : replicate label; platform + tissue + replicate defines a threshold unit
+#     scope      : gene, te, or both, the features this file describes
+#     options    : key=value;... overrides of the preset (key_col, key_regex, value_col,
+#                  agg, fill, filter, keep_cols)
+#
+# Outputs (using the provided prefix):
+#     - .qs : full data frame, annotation plus one column per sample, extras, and labels
+#     - _labels.tsv : ID, coordinates, Passed_Platforms, Activity, and the score columns
+#     - _breakpoints.csv : segmented-regression thresholds per unit, raw and log1p
+#     - _manifest.tsv : copy of the manifest used, for provenance
+#     - _config.yml : copy of the config used, for provenance
+#
+# Dependencies: data.table, yaml, qs, segmented, matrixStats (DECLTR-env)
+#
+# Usage (validate first, then run):
+#     Rscript DECLTR.r \
+#         --manifest configs/decltr_manifest.example.tsv \
+#         --config configs/decltr_config.example.yml \
+#         --validate
+#
+#     Rscript DECLTR.r \
+#         --manifest configs/decltr_manifest.example.tsv \
+#         --config configs/decltr_config.example.yml \
+#         --out results/b73_run1 \
+#         --threads 8
+#
+# Draft a manifest for a new dataset with scripts/make_manifest.sh, then fill in the
+# tissue and replicate columns by hand. Unit tests: bash test/run_unit_tests.sh
 
-## NOTE that this script, because it is based on outputs of previous steps of the LTR pipeline, 
-##  is designed explicitly to study intact (structural) LTRs. The renaming and merging is
-##  built on the assumption that the input files are based EDTA gff annotation naming convention for 
-##  LTRs and their repeat regions. 
-
-#----------------------------------------------
-#  Load libraries
-#----------------------------------------------
-library(dplyr)
-library(readr)
-library(tidyr)
-library(stringr)
-library(Rsamtools)
-library(GenomicAlignments)
-library(GenomicFeatures)
-library(GenomicRanges)
-library(DESeq2)
-library(BiocParallel)
-library(openxlsx)
-library(qs)
-
-
-#----------------------------------------------
-#  Paths and file lists
-#----------------------------------------------
-data_dir <- "/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/DECLTR/GenomicData"
-isoform_dir <- "/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/DECLTR/IsoformData"
-motif_dir <- "/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/DECLTR/MotifData"
-combined_ref <- "/home/caleb/data/genome_and_annotations/TE_B73_UpdatedStrands_wGenes.gff"
-illumina_path <- "/home/caleb/data/PaperWritingReruns/Dec2025_BugFix/NAM_Reproc/Intersects/B73NAM_MergedCounts_StrucLTRsGenes.tsv"
-
-data_fps <- list.files(data_dir, full.names = TRUE)
-isoform_fps <- list.files(isoform_dir, pattern = ".tsv$", full.names = TRUE)
-motif_fps <- list.files(motif_dir, pattern = ".tsv$", full.names = TRUE)
-
-#----------------------------------------------
-#  Reset merged_df to start fresh
-#----------------------------------------------
-if (exists("merged_df")) rm(merged_df)
-
-#----------------------------------------------
-#  Read base GFF annotation into DataFrame
-#----------------------------------------------
-te_df <- read_tsv(combined_ref,
-  comment = "#", col_names = FALSE,
-  col_types = cols(.default = "c")
-) %>%
-  tidyr::separate_rows(X9, sep = ";") %>%
-  tidyr::separate(X9, into = c("key", "value"), sep = "=", fill = "right") %>%
-  dplyr::select(X1, X3, X4, X5, X7, key, value) %>%
-  tidyr::pivot_wider(
-    names_from = key, 
-    values_from = value,
-    values_fn = list(value = toString)
-  ) %>%
-  dplyr::rename(
-    Chr   = X1,
-    Type  = X3,
-    Start = X4,
-    End   = X5,
-    Strand = X7
-  ) %>%
-  filter(
-    Type == "gene" |
-      str_detect(Type, "LTR_retrotransposon")
-  ) %>%
-  relocate(ID) %>%
-  dplyr::select(-Type)
-
-#----------------------------------------------
-#  Merge overlap/vector data
-#----------------------------------------------
-
-# Record the IDs
-vectors_df <- data.frame(ID = te_df$ID, stringsAsFactors = FALSE)
-
-for (fp in data_fps) {
-  print(paste("Processing file:", basename(fp)))
-  # strip off suffix to get name like "Ears_H3K27ac.1" or "LTRRTs_Genes_UMR"
-  nm <- sub("_peaks\\.intsct\\.gff$|_intsct\\.gff$", "", basename(fp))
-
-  # read in the file
-  df <- read.table(fp,
-    header = FALSE,
-    sep = "\t",
-    quote = "",
-    comment.char = "",
-    fill = TRUE
-  )
-
-  # extract TE IDs from the 9th column
-  ids <- sapply(
-    strsplit(df[, 9], ";"),
-    function(x) sub(".*ID=([^;]+).*", "\\1", x[1])
-  )
-
-  if (grepl("H3K", nm)) {
-    # ChIP‐seq intersects: take the maximum of column 14 (read count)
-    tmp <- data.frame(
-      ID = ids,
-      val = df[, 14],
-      stringsAsFactors = FALSE
-    )
-    agg <- tmp %>%
-      group_by(ID) %>%
-      summarize(val = max(val, na.rm = TRUE), .groups = "drop")
-    default_val <- 0
-  } else if (grepl("UMR", nm)) {
-    # UMR intersects: take just the first column 16 value (mean meth)
-    tmp <- data.frame(
-      ID = ids,
-      val = df[, 16],
-      stringsAsFactors = FALSE
-    )
-    agg <- tmp[!duplicated(tmp$ID), , drop = FALSE]
-    default_val <- 100
-  } else {
-    # skip anything else
-    next
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+parse_args <- function(args) {
+  out <- list(manifest = NULL, config = NULL, out = NULL, validate = FALSE, threads = 1L)
+  i <- 1
+  while (i <= length(args)) {
+    a <- args[i]
+    take <- function() { if (i + 1 > length(args)) stop("Missing value for ", a); i <<- i + 1; args[i] }
+    switch(a,
+      "--manifest" = out$manifest <- take(),
+      "--config"   = out$config <- take(),
+      "--out"      = out$out <- take(),
+      "--threads"  = out$threads <- as.integer(take()),
+      "--validate" = out$validate <- TRUE,
+      "-h" =, "--help" = { print_header(); quit(status = 0) },
+      stop("Unknown argument: ", a))
+    i <- i + 1
   }
-
-  # Rename and merge, fill NAs with file‐specific default
-  colnames(agg)[2] <- nm
-  vectors_df <- left_join(vectors_df, agg, by = "ID")
-  vectors_df[[nm]][is.na(vectors_df[[nm]])] <- default_val
-}
-
-# Attach new columns back to te_df
-merged_df <- left_join(te_df, vectors_df, by = "ID")
-
-#----------------------------------------------
-#  Merge TSS & totals (Gene & LTR)
-#----------------------------------------------
-tss_files <- list.files(isoform_dir, pattern = "TSS", full.names = TRUE)
-for (fp in tss_files) {
-  print(paste("Processing file:", basename(fp)))
-  label <- if (grepl("CT", basename(fp), ignore.case = TRUE)) {
-    sub("(?i)[._-]?TSS.*$", "", basename(fp), perl = TRUE)
-  } else if (grepl("Cold", basename(fp), ignore.case = TRUE)) {
-    "Cold"
-  } else if (grepl("^PB", basename(fp), ignore.case = TRUE)) {
-    # for files like PB_Ear_TSS.tsv, this gives "PB_Ear"
-    sub("(?i)[._-]?TSS.*$", "", basename(fp), perl = TRUE)
-  } else if (grepl("ONTPB", basename(fp), ignore.case = TRUE)) {
-	  label <- "ONTPB"
-  } else {
-    stop("unrecognized classifier file: ", fp)
-  }
-  df_tss <- readr::read_tsv(fp, col_types = cols(.default = "c"))
-  if (grepl("Gene", basename(fp), ignore.case = TRUE)) {
-    df_tss <- df_tss %>%
-      dplyr::rename(ID = Gene) %>%
-      dplyr::select(ID, Total_Reads, TSS1, Count1, TSS2, Count2) %>%
-      dplyr::mutate(
-        Total_Reads = as.numeric(Total_Reads),
-        TSS1        = as.integer(TSS1),
-        Count1      = as.numeric(Count1),
-        TSS2        = as.integer(TSS2),
-        Count2      = as.numeric(Count2)
-      ) %>%
-      dplyr::rename_with(~ paste0("gene_", .x, "_", label), -ID)
-    # join genes by ID → ID
-    merged_df <- left_join(merged_df, df_tss, by = "ID")
-  } else if (grepl("LTR", basename(fp), ignore.case = TRUE)) {
-    df_tss <- df_tss %>%
-      dplyr::rename(ID = Feature) %>%
-      dplyr::select(ID, Total_Reads, TSS1, Count1, TSS2, Count2) %>%
-      dplyr::mutate(
-        Total_Reads = as.numeric(Total_Reads),
-        TSS1        = as.integer(TSS1),
-        Count1      = as.numeric(Count1),
-        TSS2        = as.integer(TSS2),
-        Count2      = as.numeric(Count2)
-      ) %>%
-      dplyr::rename_with(~ paste0("LTR_", .x, "_", label), -ID)
-    merged_df <- dplyr::left_join(merged_df, df_tss,
-      by = c("Parent" = "ID")
-    )
-  } else {
-    next
-}
-}
-# fill NAs post-TSS merge
-merged_df <- merged_df %>%
-  dplyr::mutate(
-    dplyr::across(where(is.numeric), ~ tidyr::replace_na(., 0)),
-    dplyr::across(where(is.logical), ~ tidyr::replace_na(., FALSE))
-  )
-
-#----------------------------------------------
-#  Merge classifier isoform files (counts)
-#----------------------------------------------
-classifier_files <- list.files(isoform_dir, pattern = "isoforms.tsv$", full.names = TRUE)
-for (fp in classifier_files) {
-  # pull the filename into a variable
-  base <- basename(fp)
-  print(paste("Processing file:", base))
-  # decide label
-  if (grepl("CT[0-9]+", base, ignore.case = TRUE)) {
-    label <- sub("(?i)(CT[0-9]+).*", "\\1", base, perl = TRUE)
-  } else if (grepl("CTMerge", base, ignore.case = TRUE)) {
-    label <- "CTMerge"
-  } else if (grepl("Cold", base, ignore.case = TRUE)) {
-    label <- "Cold"
-  } else if (grepl("^PB", base, ignore.case = TRUE)) {
-    # for files like PB_Ear_isoforms.tsv, this gives "PB_Ear"
-    label <- sub("^(PB_[^_]+).*", "\\1", base)
-  } else if (grepl("ONTPB", base, ignore.case = TRUE)) {
-    label <- "ONTPB"
-  } else {
-    stop("unrecognized classifier file: ", fp)
-  }
-
-  # Check if file is Gene or LTR
-  is_gene <- grepl("Gene", base, ignore.case = TRUE)
-
-  if (is_gene) {
-    # Gene input: standard GFF, only one read count (col 10)
-    df_counts <- readr::read_tsv(fp, col_types = cols(.default = "c")) %>%
-      dplyr::mutate(
-        ID = sub(".*ID=([^;]+).*", "\\1", attrs), # column 9 = attributes
-        gene_count = as.numeric(int_count) # column 10 = read count
-      ) %>%
-      dplyr::select(ID, gene_count) %>%
-      dplyr::rename_with(~ paste0(.x, "_", label), -ID)
-    merged_df <- dplyr::left_join(merged_df, df_counts, by = "ID")
-  } else {
-    df_counts <- readr::read_tsv(fp, col_types = cols(.default = "c")) %>%
-      dplyr::mutate(
-        # extract the Parent ID as *character*
-        ID = sub(".*Parent=([^;]+).*", "\\1", attrs),
-        # convert only the count columns to numeric
-        across(c(
-          total_reads, ltr_left_reads, spliced_ltr_left, ltr_right_reads, spliced_ltr_right,
-          spanning_reads, spliced_spanning, ro5_reads, spliced_ro5, ro3_reads, spliced_ro3
-        ), as.numeric)
-      ) %>%
-      dplyr::select(
-        ID, total_reads, ltr_left_reads, spliced_ltr_left, ltr_right_reads, spliced_ltr_right,
-        spanning_reads, spliced_spanning, ro5_reads, spliced_ro5, ro3_reads, spliced_ro3
-      ) %>%
-      dplyr::rename_with(~ paste0(.x, "_", label), -ID)
-
-    merged_df <- dplyr::left_join(
-      merged_df,
-      df_counts,
-      by = c("Parent" = "ID")
-    )
-  }
-}
-
-# fill any NAs
-merged_df <- merged_df %>%
-  mutate(
-    across(where(is.numeric), ~ replace_na(., 0)),
-    across(where(is.logical), ~ replace_na(., FALSE))
-  )
-
-#----------------------------------------------
-#  Merge ONT-only motif data (both LTRs and genes)
-#----------------------------------------------
-ont_files <- motif_fps[grepl("ONT", basename(motif_fps))]
-for (fp in ont_files) {
-  print(paste("Processing file:", basename(fp)))
-  label <- ifelse(grepl("ONTPB", basename(fp), ignore.case = TRUE), "ONTPB", "ONTPB")
-
-  # 1) read in, ensure an ID column
-  df_m <- readr::read_tsv(fp, col_types = cols(.default = "c"))
-  if ("Feature" %in% names(df_m)) {
-    names(df_m)[names(df_m) == "Feature"] <- "ID"
-  } else if ("feature" %in% names(df_m)) {
-    names(df_m)[names(df_m) == "feature"] <- "ID" 
-  } else if (!"ID" %in% names(df_m)) {
-    stop("No 'Feature' or 'ID' column in motif file: ", fp)
-  }
-
-  # 2) coerce types
-  df_m <- df_m %>%
-    mutate(
-      across(contains("present"), as.logical),
-      across(matches("^(Dist_|TSS_abs)"), as.integer)
-    )
-
-  # 3) rename all motif columns to avoid collisions
-  #    - for LTRs prefix with "LTR_motif_",
-  #    - for genes "gene_motif_"
-  is_gene <- grepl("Gene", basename(fp), ignore.case = TRUE)
-  prefix <- if (is_gene) "gene_motif_" else "LTR_motif_"
-  df_m <- df_m %>% rename_with(~ paste0(prefix, .x, "_", label), -ID)
-
-  # 4) join back into merged_df
-  if (is_gene) {
-    # join on ID == ID
-    merged_df <- left_join(merged_df, df_m, by = "ID")
-  } else {
-    # join on Parent == ID for LTRs
-    merged_df <- left_join(merged_df, df_m, by = c("Parent" = "ID"))
-  }
-}
-
-# 5) finally fill in NAs
-merged_df <- merged_df %>%
-  mutate(
-    across(where(is.numeric), ~ replace_na(., 0)),
-    across(where(is.logical), ~ replace_na(., FALSE))
-  )
-
-#----------------------------------------------
-#  Add CAGE data
-#----------------------------------------------
-cage_dir <- "/home/caleb/data/PaperWritingReruns/GenBio_25/CAGE"
-cage_files <- list.files(cage_dir, pattern = "formatted.gff$", full.names = TRUE)
-
-attach_cage_from_gff <- function(df, gff_path, id_col = "ID", col_prefix = NULL) {
-  g <- read.table(gff_path,
-    sep = "\t", header = FALSE,
-    quote = "", comment.char = "#", fill = TRUE,
-    stringsAsFactors = FALSE, colClasses = "character"
-  )
-  stopifnot(ncol(g) >= 14)
-
-  id9 <- sub(".*\\bID=([^;]+).*", "\\1", g[[9]])
-
-  as_int_safe <- function(x) suppressWarnings(as.integer(x))
-  cage_start <- as_int_safe(g[[10]])
-  cage_end <- as_int_safe(g[[11]])
-  cage_str <- g[[12]]
-  cage_dTSS <- as_int_safe(g[[13]])
-
-  shape_field <- g[[14]]
-  m <- regexpr("Shape=([^;]+)", shape_field, perl = TRUE)
-  cage_shape <- ifelse(m > 0, sub("Shape=([^;]+).*", "\\1", regmatches(shape_field, m)), NA)
-
-  cage_df <- data.frame(
-    ID = id9,
-    CAGE_Start = cage_start,
-    CAGE_End = cage_end,
-    CAGE_Str = cage_str,
-    CAGE_dTSS = cage_dTSS,
-    CAGE_Shape = cage_shape,
-    stringsAsFactors = FALSE
-  )
-
-  # ---- NEW: prefix the added columns when requested ----
-  if (!is.null(col_prefix) && nzchar(col_prefix)) {
-    nc <- names(cage_df) != "ID"
-    names(cage_df)[nc] <- paste0(col_prefix, "_", names(cage_df)[nc])
-  }
-  # ------------------------------------------------------
-
-  cage_df <- cage_df[!duplicated(cage_df$ID), ]
-
-  names(cage_df)[names(cage_df) == "ID"] <- id_col
-  merge(df, cage_df, by = id_col, all.x = TRUE, sort = FALSE)
-}
-
-for (fp in cage_files) {
-  base <- basename(fp)
-  message("Processing file: ", base)
-
-  # first word before the first underscore, e.g. "Root" from "Root_dTSS_..."
-  prefix <- sub("_.*$", "", base)
-
-  merged_df <- attach_cage_from_gff(merged_df, fp, id_col = "ID", col_prefix = prefix)
-}
-
-#----------------------------------------------
-#  Add B73 NAM data
-#----------------------------------------------
-read_illumina_counts <- function(path, id_key = "ID", count_prefix = NULL) {
-  df <- readr::read_tsv(path, col_types = readr::cols(.default = "c"), comment = "")
-
-  # normalize header
-  names(df) <- trimws(gsub("\uFEFF", "", names(df)))
-
-  if (!"Attributes" %in% names(df)) stop("Illumina file must have an 'Attributes' column: ", path)
-
-  # pull ID from Attributes
-  df$ID <- sub(paste0(".*\\b", id_key, "=([^;]+).*"), "\\1", df$Attributes)
-  df$ID <- trimws(df$ID)
-
-  # detect count columns: keep everything that is NOT GFF-ish and NOT Attributes/ID
-  gff_cols <- intersect(names(df), c("Chr", "Source", "Name", "Start", "End", "Score", "Strand", "Phase"))
-  drop_cols <- unique(c(gff_cols, "Attributes", "ID"))
-
-  count_cols <- setdiff(names(df), drop_cols)
-
-  if (length(count_cols) == 0) stop("No count columns detected in Illumina file: ", path)
-
-  # convert counts to numeric safely
-  df <- df |>
-    dplyr::mutate(
-      dplyr::across(
-        dplyr::all_of(count_cols),
-        ~ suppressWarnings(as.numeric(.x))
-      )
-    )
-
-  # if you want to prefix to avoid collisions with existing columns, do it here
-  if (!is.null(count_prefix) && nzchar(count_prefix)) {
-    df <- df |> dplyr::rename_with(~ paste0(count_prefix, "_", .x), dplyr::all_of(count_cols))
-    count_cols <- paste0(count_prefix, "_", count_cols)
-  }
-
-  # aggregate duplicates (very common if file has multiple rows per ID)
-  df_out <- df |>
-    dplyr::select(ID, dplyr::all_of(count_cols)) |>
-    dplyr::group_by(ID) |>
-    dplyr::summarise(dplyr::across(dplyr::everything(), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
-
-  df_out
-}
-message("Processing Illumina counts: ", basename(illumina_path))
-
-illumina_df <- read_illumina_counts(illumina_path, id_key = "ID", count_prefix = NULL)
-
-merged_df <- dplyr::left_join(merged_df, illumina_df, by = "ID")
-
-# fill any NAs introduced by join (counts -> 0)
-merged_df <- merged_df |>
-  dplyr::mutate(
-    dplyr::across(dplyr::all_of(setdiff(names(illumina_df), "ID")), ~ tidyr::replace_na(.x, 0))
-  )
-
-
-#----------------------------------------------
-#  Quick Cleanup
-#----------------------------------------------
-merged_df <- merged_df %>% dplyr::select(
-  -motif, -tsd, -TSD, -TIR,
-  -biotype, -logic_name, -Sequence_ontology
-)
-merged_df <- merged_df %>%
-  dplyr::select(
-    -dplyr::contains("classifier_source"),
-    -dplyr::contains("source_file")
-  )
-#----------------------------------------------
-#  Filter, Pass to Thresholding
-#----------------------------------------------
-filtered_merged_df <- merged_df %>%
-  filter(!str_detect(Chr, regex("scaf", ignore_case = TRUE)))
-
-decltr_res_df <- filtered_merged_df |>
-  dplyr::mutate(Classification = coalesce(Classification, "Gene"))
-
-decltr_res_df$ID <- trimws(as.character(decltr_res_df$ID))
-
-# Coalesce helper (treat missing counts as 0 for all downstream sums)
-coalesce0 <- function(x) dplyr::coalesce(x, 0)
-
-# Expand a semicolon-separated key=value attribute column into wide columns
-expand_attr_column <- function(df, attr_col, prefix = NULL) {
-  if (!attr_col %in% names(df)) {
-    stop(sprintf("Column '%s' not found in data frame.", attr_col))
-  }
-
-  base_cols <- setdiff(names(df), attr_col)
-
-  out <- df |>
-    mutate(
-      .rid  = row_number(),
-      .attr = .data[[attr_col]]
-    ) |>
-    separate_rows(.attr, sep = ";\\s*") |>
-    separate(.attr, into = c("key", "value"), sep = "=", fill = "right", extra = "merge") |>
-    mutate(key = str_trim(key), value = str_trim(value)) |>
-    filter(!is.na(key), key != "") |>
-    pivot_wider(
-      id_cols     = c(.rid, all_of(base_cols)),
-      names_from  = key,
-      values_from = value,
-      values_fn   = ~ paste(unique(na.omit(.x)), collapse = ";")
-    )
-
-  if (!is.null(prefix) && nzchar(prefix)) {
-    new_cols <- setdiff(names(out), c(".rid", base_cols))
-    names(out)[match(new_cols, names(out))] <- paste0(prefix, new_cols)
-  }
-
-  out |> select(-.rid)
-}
-
-# Logistic on log-delta. delta=0 => evidence 0.5.
-sigmoid01_delta <- function(delta, s = 0.35) {
-  1 / (1 + exp(-delta / s))
-}
-
-# Median of thresholds for a group of Illumina columns
-# (unified: no feature_type distinction)
-group_thr_illumina <- function(cols, THRESH_ILLUMINA) {
-  thr_vec <- THRESH_ILLUMINA[cols]
-  thr <- suppressWarnings(median(as.numeric(thr_vec), na.rm = TRUE))
-  if (!is.finite(thr)) thr <- 1
-  thr
-}
-
-# PB: read from THRESH_PB by tissue name
-# (unified: no feature_type distinction)
-group_thr_pb <- function(tissue, THRESH_PB) {
-  thr <- THRESH_PB[[tissue]]
-  thr <- as.numeric(thr)
-  if (!is.finite(thr)) thr <- 1
-  thr
-}
-
-# ONT: one unified threshold
-group_thr_ont <- function(THRESH_ONT_CT) {
-  thr <- as.numeric(THRESH_ONT_CT)
-  if (!is.finite(thr)) thr <- 1
-  thr
-}
-
-# =========================
-# 2) Column discovery
-# =========================
-nm <- names(decltr_res_df)
-
-## Illumina expression columns (counts)
-illumina_cols <- grep("^B73NAM_", nm, value = TRUE)
-
-## All PB_* columns (for numeric casting)
-pb_all_cols <- grep("PB_", nm, value = TRUE)
-
-## All per-locus PB expression columns (total reads)
-pb_expr_cols_gene <- grep("^gene_Total_Reads_PB_", nm, value = TRUE)
-pb_expr_cols_ltr  <- grep("^LTR_Total_Reads_PB_",  nm, value = TRUE)
-pb_expr_cols_all  <- c(pb_expr_cols_gene, pb_expr_cols_ltr)
-
-## Helper: PB expression columns per tissue (for grouping)
-pb_expr_cols_by_tissue <- function(tissue) {
-  grep(paste0("Total_Reads_PB_", tissue, "_"), pb_expr_cols_all, value = TRUE)
-}
-
-## Tissues present in the PB expression columns
-pb_tissues_expr <- unique(sub(".*Total_Reads_PB_([^_]+)_.*", "\\1", pb_expr_cols_all))
-pb_tissues_expr <- sort(pb_tissues_expr)
-
-## ONT CT merged columns, per feature type
-ont_ct_merge_cols_gene <- grep("^gene_Total_Reads_ONT_CTMerge", nm, value = TRUE)
-ont_ct_merge_cols_ltr  <- grep("^LTR_Total_Reads_ONT_CTMerge",  nm, value = TRUE)
-ont_ct_merge_cols      <- c(ont_ct_merge_cols_gene, ont_ct_merge_cols_ltr)
-
-## ONT per-replicate columns (CT1, CT2, CT3 treated as distinct biological replicates)
-ont_ct_reps <- c("CT1", "CT2", "CT3")
-ont_ct_rep_cols <- setNames(lapply(ont_ct_reps, function(rep) {
-  c(grep(paste0("^gene_Total_Reads_ONT_", rep, "_"), nm, value = TRUE),
-    grep(paste0("^LTR_Total_Reads_ONT_",  rep, "_"), nm, value = TRUE))
-}), ont_ct_reps)
-ont_ct_rep_cols_all <- unlist(ont_ct_rep_cols, use.names = FALSE)
-
-## ONT Cold columns (if any)
-cold_cols <- grep("Cold", nm, value = TRUE)
-
-## ChIP & UMR
-chip_cols <- grep("H3K4me3|H3K27ac", nm, value = TRUE)
-umr_col   <- grep("_UMR$", nm, value = TRUE)[1]
-if (length(umr_col) == 0) stop("Could not find a column ending with '_UMR'.")
-
-## Ensure relevant numeric columns are numeric
-to_numeric <- unique(c(
-  illumina_cols,
-  pb_all_cols,
-  ont_ct_merge_cols,
-  ont_ct_rep_cols_all,
-  cold_cols,
-  chip_cols,
-  umr_col
-))
-for (cc in to_numeric) {
-  if (cc %in% names(decltr_res_df)) {
-    suppressWarnings({
-      decltr_res_df[[cc]] <- as.numeric(decltr_res_df[[cc]])
-    })
-  }
-}
-
-# =========================
-# 2.5) Regression Helper
-# =========================
-estimate_seg_threshold <- function(counts, max_k = 20L, default = 1L) {
-  counts <- coalesce0(counts)
-  max_count <- max(counts, na.rm = TRUE)
-  if (!is.finite(max_count) || max_count < 1) return(default)
-
-  max_k <- min(max_k, max_count)
-
-  seg_df <- data.frame(
-    threshold      = seq_len(max_k),
-    loci_remaining = vapply(seq_len(max_k),
-                            function(t) sum(counts >= t, na.rm = TRUE),
-                            integer(1))
-  )
-
-  lm0 <- lm(loci_remaining ~ threshold, data = seg_df)
-  seg <- try(
-    segmented::segmented(lm0, seg.Z = ~ threshold, psi = list(threshold = 5)),
-    silent = TRUE
-  )
-
-  if (inherits(seg, "try-error")) return(default)
-
-  est <- seg$psi[1, "Est."]
-  thr <- floor(est)
-  thr <- max(1L, min(thr, max_k))
-  thr
-}
-
-# =========================
-# 3) ONT segmented regression — per biological replicate (CT1, CT2, CT3)
-# =========================
-
-THRESH_ONT_CT <- setNames(rep(NA_real_, length(ont_ct_reps)), ont_ct_reps)
-for (rep in ont_ct_reps) {
-  rep_cols <- ont_ct_rep_cols[[rep]]
-  if (length(rep_cols)) {
-    counts <- coalesce0(rowSums(decltr_res_df[, rep_cols, drop = FALSE], na.rm = TRUE))
-    THRESH_ONT_CT[[rep]] <- estimate_seg_threshold(counts, default = 1L)
-  } else {
-    THRESH_ONT_CT[[rep]] <- 1L
-  }
-}
-
-## TEMP
-ONT_THRESH_COLD <- 1
-
-# =========================
-# 4) PacBio segmented regression per tissue — UNIFIED across all loci
-# =========================
-
-PB_THRESH <- setNames(rep(NA_real_, length(pb_tissues_expr)), pb_tissues_expr)
-
-for (tissue in pb_tissues_expr) {
-  # Collect both gene and LTR columns for this tissue
-  gene_col <- grep(paste0("^gene_Total_Reads_PB_", tissue, "_"), nm, value = TRUE)
-  ltr_col  <- grep(paste0("^LTR_Total_Reads_PB_",  tissue, "_"), nm, value = TRUE)
-
-  all_tissue_cols <- c(gene_col, ltr_col)
-
-  if (length(all_tissue_cols)) {
-    # Sum across all columns for this tissue (or just use first col if only one)
-    if (length(all_tissue_cols) == 1L) {
-      counts_all <- coalesce0(decltr_res_df[[all_tissue_cols]])
-    } else {
-      counts_all <- coalesce0(rowSums(
-        decltr_res_df[, all_tissue_cols, drop = FALSE], na.rm = TRUE
-      ))
-    }
-    PB_THRESH[[tissue]] <- estimate_seg_threshold(counts_all, default = 1L)
-  } else {
-    PB_THRESH[[tissue]] <- 1L
-  }
-}
-
-THRESH_PB <- PB_THRESH   # named vector: tissue -> single threshold
-
-# =========================
-# 5) Illumina segmented regression per sample — UNIFIED across all loci
-# =========================
-
-ILL_THRESH <- setNames(rep(NA_real_, length(illumina_cols)), illumina_cols)
-
-for (cc in illumina_cols) {
-  v <- coalesce0(decltr_res_df[[cc]])
-  ILL_THRESH[[cc]] <- estimate_seg_threshold(v, default = 1L)
-}
-
-THRESH_ILLUMINA <- ILL_THRESH   # named vector: column -> single threshold
-
-# ===============================================
-# 5b) ChIP segmented regression, UMR thresholding
-# ===============================================
-
-CHIP_THRESH <- setNames(rep(NA_real_, length(chip_cols)), chip_cols)
-for (cc in chip_cols) {
-  v <- coalesce0(decltr_res_df[[cc]])
-  CHIP_THRESH[[cc]] <- estimate_seg_threshold(v, max_k = 50L, default = 1L)
-}
-
-present_chip <- decltr_res_df[, chip_cols, drop = FALSE]
-for (cc in chip_cols) {
-  present_chip[[cc]] <- coalesce0(decltr_res_df[[cc]]) >= CHIP_THRESH[[cc]]
-}
-
-umr_signal <- 1 - (replace(decltr_res_df[[umr_col]], decltr_res_df[[umr_col]] == 100, NA) / 100)
-present_umr <- is.finite(umr_signal) & (umr_signal >= 0.1)
-
-# =========================
-# Tissue groups (Illumina + PB/ONT)
-# =========================
-
-b73_tissue <- function(pattern) {
-  grep(paste0("^B73.*_", pattern, "_"), nm, value = TRUE, ignore.case = TRUE)
-}
-
-v11_base_cols   <- grep("^B73.*Base_",   nm, value = TRUE, ignore.case = TRUE)
-v11_middle_cols <- grep("^B73.*Middle_", nm, value = TRUE, ignore.case = TRUE)
-v11_tip_cols    <- grep("^B73.*Tip_",    nm, value = TRUE, ignore.case = TRUE)
-shoot_cols      <- grep("^B73.*_Shoot_", nm, value = TRUE, ignore.case = TRUE)
-
-groups <- list(
-  Embryo     = list(illumina = b73_tissue("Embryo"),    pb = pb_expr_cols_by_tissue("Embryo")),
-  Endosperm  = list(illumina = b73_tissue("Endosperm"), pb = pb_expr_cols_by_tissue("Endosperm")),
-  Root       = list(illumina = b73_tissue("Root"),      pb = pb_expr_cols_by_tissue("Root")),
-  Shoot      = list(illumina = shoot_cols),
-  V11_Base   = list(illumina = v11_base_cols),
-  V11_Middle = list(illumina = v11_middle_cols),
-  V11_Tip    = list(illumina = v11_tip_cols),
-  Ear        = list(illumina = b73_tissue("Ear"),    pb = pb_expr_cols_by_tissue("Ear")),
-  Tassel     = list(illumina = b73_tissue("Tassel"), pb = pb_expr_cols_by_tissue("Tassel")),
-  Anther     = list(illumina = b73_tissue("Anther")),
-  Pollen     = list(pb = pb_expr_cols_by_tissue("Pollen")),
-  Leaf       = list(
-    illumina = c(v11_base_cols, v11_middle_cols, v11_tip_cols),
-    ont      = ont_ct_rep_cols_all
-  ),
-  ONT_CT1    = list(ont = ont_ct_rep_cols[["CT1"]]),
-  ONT_CT2    = list(ont = ont_ct_rep_cols[["CT2"]]),
-  ONT_CT3    = list(ont = ont_ct_rep_cols[["CT3"]])
-)
-
-# ===============================================
-# 6) Score-based candidate filter — UNIFIED (no gene/LTR split)
-# ===============================================
-
-# ---- per-view totals (fast) ----
-ill_tot <- if (length(illumina_cols)) {
-  X <- as.matrix(decltr_res_df[, illumina_cols, drop = FALSE])
-  storage.mode(X) <- "numeric"
-  X[!is.finite(X)] <- 0
-  rowSums(X)
-} else {
-  rep(0, nrow(decltr_res_df))
-}
-pb_tot <- if (length(pb_expr_cols_all)) {
-  X <- as.matrix(decltr_res_df[, pb_expr_cols_all, drop = FALSE])
-  storage.mode(X) <- "numeric"
-  X[!is.finite(X)] <- 0
-  rowSums(X)
-} else {
-  rep(0, nrow(decltr_res_df))
-}
-# Per-replicate ONT totals and pass flags
-ont_rep_tots <- lapply(ont_ct_rep_cols, function(cols) {
-  if (!length(cols)) return(rep(0, nrow(decltr_res_df)))
-  X <- as.matrix(decltr_res_df[, cols, drop = FALSE])
-  storage.mode(X) <- "numeric"
-  X[!is.finite(X)] <- 0
-  rowSums(X)
-})
-ont_rep_tots_log <- lapply(ont_rep_tots, log1p)
-
-ONT_REP_SUM_THR_log <- setNames(
-  vapply(ont_ct_reps, function(rep)
-    estimate_seg_threshold(ont_rep_tots_log[[rep]], default = 1L),
-    numeric(1)),
-  ont_ct_reps
-)
-
-ill_tot_log <- log1p(ill_tot)
-pb_tot_log  <- log1p(pb_tot)
-
-# ---- UNIFIED summary thresholds (all loci together) ----
-ILL_SUM_THR_log <- estimate_seg_threshold(ill_tot_log, default = 1L)
-PB_SUM_THR_log  <- estimate_seg_threshold(pb_tot_log,  default = 1L)
-
-segmented_breakpoints <- rbind(
-  data.frame(
-    Platform  = "ONT",
-    Sample    = ont_ct_reps,
-    Breakpoint_log1p = unname(THRESH_ONT_CT)
-  ),
-  data.frame(
-    Platform  = "PacBio",
-    Sample    = names(THRESH_PB),
-    Breakpoint_log1p = unname(THRESH_PB)
-  ),
-  data.frame(
-    Platform  = "Illumina",
-    Sample    = names(ILL_THRESH),
-    Breakpoint_log1p = unname(ILL_THRESH)
-  )
-)
-names(segmented_breakpoints)[names(segmented_breakpoints) == "Breakpoint_log1p"] <- "Breakpoint_raw"
-segmented_breakpoints$Breakpoint_log1p <- log1p(segmented_breakpoints$Breakpoint_raw)
-write.csv(segmented_breakpoints, "Segmented_Breakpoints.csv", row.names = FALSE)
-
-# ---- UNIFIED pass flags (same threshold for genes and LTRs) ----
-pass_ill_sum <- ill_tot_log >= ILL_SUM_THR_log
-pass_pb_sum  <- pb_tot_log  >= PB_SUM_THR_log
-# ONT: passes if any single replicate clears its own threshold
-pass_ont_reps <- mapply(function(tot, thr) tot >= thr,
-  ont_rep_tots_log, as.list(ONT_REP_SUM_THR_log),
-  SIMPLIFY = FALSE)
-pass_ont_sum <- Reduce("|", pass_ont_reps)
-
-# Note: Classification column is retained in the data for interpretability in
-# the output, but plays no role in filtering or threshold decisions.
-
-decltr_res_df$Passed_Platforms <- paste0(
-  ifelse(pass_ill_sum, "Illumina;", ""),
-  ifelse(pass_pb_sum,  "PacBio;",   ""),
-  ifelse(pass_ont_sum, "ONT;",      "")
-)
-decltr_res_df$Passed_Platforms[decltr_res_df$Passed_Platforms == ""] <- NA
-
-# ---- chromatin keep ----
-keep_any_chip <- if (length(chip_cols)) {
-  rowSums(as.matrix(present_chip[, chip_cols, drop = FALSE]), na.rm = TRUE) > 0
-} else {
-  rep(FALSE, nrow(decltr_res_df))
-}
-
-umr_vec <- as.numeric(decltr_res_df[[umr_col]])
-umr_vec[umr_vec == 100] <- NA
-umr_signal       <- 1 - (umr_vec / 100)
-umr_signal       <- pmin(pmax(umr_signal, 0), 1)
-keep_any_umr     <- is.finite(umr_signal) & (umr_signal >= 0.1)
-
-# ---- final candidate set (unified filter) ----
-keep_for_scoring <- pass_ill_sum | pass_pb_sum | pass_ont_sum | keep_any_chip | keep_any_umr
-
-# Single unified subset — genes and LTRs filtered identically
-decltr_sub <- decltr_res_df[keep_for_scoring, , drop = FALSE]
-
-nrow(decltr_sub)
-
-compute_chrom_support <- function(df, chip_cols, present_chip_df, umr_col) {
-  chip_pass_frac <- if (length(chip_cols)) {
-    M <- as.matrix(present_chip_df[, chip_cols, drop = FALSE])
-    storage.mode(M) <- "logical"
-    rowMeans(M, na.rm = TRUE)
-  } else {
-    rep(0, nrow(df))
-  }
-
-  umr_vec    <- as.numeric(df[[umr_col]])
-  umr_vec[umr_vec == 100] <- NA
-  umr_signal <- 1 - (umr_vec / 100)
-  umr_signal <- pmin(pmax(umr_signal, 0), 1)
-  umr_signal[!is.finite(umr_signal)] <- NA_real_
-
-  chrom_support <- pmax(chip_pass_frac, umr_signal, na.rm = TRUE)
-  chrom_support[!is.finite(chrom_support)] <- 0
-  chrom_support
-}
-
-present_chip_sub <- if (length(chip_cols)) {
-  out <- decltr_sub[, chip_cols, drop = FALSE]
-  for (cc in chip_cols) out[[cc]] <- coalesce0(decltr_sub[[cc]]) >= CHIP_THRESH[[cc]]
+  if (is.null(out$manifest) || is.null(out$config)) stop("--manifest and --config are required")
   out
-} else {
-  NULL
-}
-chrom_support <- compute_chrom_support(decltr_sub, chip_cols, present_chip_sub, umr_col)
-names(chrom_support) <- decltr_sub$ID
-
-log1p_safe <- function(x) log1p(coalesce0(as.numeric(x)))
-
-zscore_rows <- function(mat) {
-  mat <- as.matrix(mat)
-  mu  <- rowMeans(mat, na.rm = TRUE)
-  sd  <- matrixStats::rowSds(mat, na.rm = TRUE)
-  sd[!is.finite(sd) | sd == 0] <- 1
-  sweep(sweep(mat, 1, mu, "-"), 1, sd, "/")
 }
 
-dominance_margin <- function(v_named) {
-  v <- sort(as.numeric(v_named), decreasing = TRUE)
-  if (length(v) < 2) return(Inf)
-  v[1] - v[2]
+# Print the comment block at the top of this file as the help text, so the two
+# can never drift apart.
+print_header <- function() {
+  lines <- readLines(script_path())
+  lines <- lines[-1]                                   # drop the shebang
+  lines <- lines[seq_len(which(!startsWith(lines, "#"))[1] - 1)]
+  cat(sub("^#[ ]?", "", lines), sep = "\n")
+  cat("\n")
 }
 
-# ------------------------------------------------------------
-# BUILD OMICS BLOCKS (raw -> log1p -> row-z) from decltr_res_df
-# ------------------------------------------------------------
-build_omics_matrices <- function(decltr_res_df,
-                                 groups,
-                                 illumina_cols,
-                                 pb_expr_cols_all,
-                                 chip_cols,
-                                 umr_col) {
-  df <- decltr_res_df %>%
-    mutate(ID = trimws(as.character(ID))) %>%
-    distinct(ID, .keep_all = TRUE)
-
-  loci <- df$ID
-
-  summarize_group_median <- function(df, cols) {
-    cols <- intersect(cols, names(df))
-    if (length(cols) == 0) return(rep(NA_real_, nrow(df)))
-    x <- as.matrix(df[, cols, drop = FALSE])
-    matrixStats::rowMedians(x, na.rm = TRUE)
-  }
-
-  # ---- Illumina group summaries ----
-  ill_group_names <- names(groups)[vapply(groups, function(g) !is.null(g$illumina), logical(1))]
-  ill_mat <- sapply(ill_group_names, function(gname) {
-    cols <- groups[[gname]]$illumina
-    tmp  <- df
-    if (length(cols)) tmp[, cols] <- lapply(tmp[, cols, drop = FALSE], log1p_safe)
-    summarize_group_median(tmp, cols)
-  })
-  ill_mat <- t(ill_mat)
-  rownames(ill_mat) <- ill_group_names
-  colnames(ill_mat) <- loci
-
-  # ---- PacBio group summaries ----
-  pb_mat <- NULL
-  pb_group_names <- names(groups)[vapply(groups, function(g) !is.null(g$pb), logical(1))]
-  if (length(pb_group_names)) {
-    pb_mat <- sapply(pb_group_names, function(gname) {
-      cols <- groups[[gname]]$pb
-      tmp  <- df
-      if (length(cols)) tmp[, cols] <- lapply(tmp[, cols, drop = FALSE], log1p_safe)
-      summarize_group_median(tmp, cols)
-    })
-    pb_mat <- t(pb_mat)
-    rownames(pb_mat) <- pb_group_names
-    colnames(pb_mat) <- loci
-  }
-
-  # ---- ONT: one row per group with $ont slot (Leaf combined + per-replicate) ----
-  ont_mat <- NULL
-  ont_group_names <- names(groups)[vapply(groups, function(g) !is.null(g$ont), logical(1))]
-  if (length(ont_group_names)) {
-    ont_rows <- sapply(ont_group_names, function(gname) {
-      cols <- groups[[gname]]$ont
-      tmp  <- df
-      if (length(cols)) tmp[, cols] <- lapply(tmp[, cols, drop = FALSE], log1p_safe)
-      summarize_group_median(tmp, cols)
-    })
-    ont_mat <- t(ont_rows)
-    rownames(ont_mat) <- ont_group_names
-    colnames(ont_mat) <- loci
-  }
-
-  # ---- ChIP ----
-  chip_mat <- NULL
-  if (length(chip_cols) > 0) {
-    tmp <- df
-    tmp[, chip_cols] <- lapply(tmp[, chip_cols, drop = FALSE], log1p_safe)
-    chip_mat <- t(as.matrix(tmp[, chip_cols, drop = FALSE]))
-    rownames(chip_mat) <- chip_cols
-    colnames(chip_mat) <- loci
-  }
-
-  # ---- UMR ----
-  umr_vec    <- as.numeric(df[[umr_col]])
-  umr_vec[umr_vec == 100] <- NA
-  umr_signal <- 1 - (umr_vec / 100)
-  umr_signal <- pmin(pmax(umr_signal, 0), 1)
-  umr_mat    <- matrix(umr_signal, nrow = 1, dimnames = list("UMR_leaf_like", loci))
-
-  omics_log <- list(Illumina = ill_mat, PacBio = pb_mat, ONT = ont_mat, ChIP = chip_mat, UMR = umr_mat)
-  omics_log <- omics_log[!vapply(omics_log, is.null, logical(1))]
-
-  list(loci = loci, omics_log = omics_log)
+script_path <- function() {
+  f <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))
+  if (length(f)) normalizePath(f[1]) else normalizePath("DECLTR.r")
 }
 
-# ---- ChIP evidence per locus ----
-chip_pass_frac <- if (length(chip_cols)) {
-  M <- as.matrix(present_chip[, chip_cols, drop = FALSE])
-  storage.mode(M) <- "logical"
-  rowMeans(M, na.rm = TRUE)
-} else {
-  rep(0, nrow(decltr_res_df))
-}
-umr_ev <- umr_signal
-umr_ev[!is.finite(umr_ev)] <- NA_real_
+opt <- parse_args(commandArgs(trailingOnly = TRUE))
+lib_dir <- file.path(dirname(script_path()), "decltr")
+for (f in c("io.R", "model.R", "thresholds.R", "scoring.R", "labels.R", "validate.R"))
+  source(file.path(lib_dir, f))
+suppressPackageStartupMessages(library(qs))
+data.table::setDTthreads(opt$threads)
 
-# ------------------------------------------------------------
-# SCORE MODEL (per tissue group)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
+cfg <- read_config(opt$config)
+manifest <- read_manifest(opt$manifest)
+prefix <- if (!is.null(opt$out)) opt$out else cfg$output_prefix
+if (is.null(prefix)) stop("Give --out or set output_prefix in the config")
+dir.create(dirname(prefix), showWarnings = FALSE, recursive = TRUE)
 
-sigmoid01 <- function(z, z0 = 0.0, s = 1.0) {
-  1 / (1 + exp(-(z - z0) / s))
-}
+feats <- read_reference_gff(cfg$reference_gff, cfg$feature_types, cfg$drop_attributes,
+                            legacy_collapse = isTRUE(cfg$legacy_collapse_duplicate_loci))
 
-# Fuse evidence per tissue group across platforms (Illumina/PB/ONT)
-compute_activity_scores_log <- function(
-    omics_log,
-    groups,
-    THRESH_ILLUMINA,
-    THRESH_PB,
-    THRESH_ONT_CT,
-    w = list(Illumina = 1.0, PacBio = 1.0, ONT = 0.7),
-    s = 0.25) {
-  loci         <- colnames(omics_log$Illumina)
-  tissue_names <- names(groups)
-
-  butter <- matrix(NA_real_,
-    nrow = length(tissue_names), ncol = length(loci),
-    dimnames = list(tissue_names, loci)
-  )
-
-  for (t in tissue_names) {
-    # --- Illumina evidence ---
-    ill_ev <- rep(NA_real_, length(loci))
-    if (!is.null(omics_log$Illumina) && t %in% rownames(omics_log$Illumina) && !is.null(groups[[t]]$illumina)) {
-      thr   <- group_thr_illumina(groups[[t]]$illumina, THRESH_ILLUMINA)
-      mid   <- log1p(thr)
-      delta <- as.numeric(omics_log$Illumina[t, ]) - mid
-      ill_ev <- sigmoid01_delta(delta, s = s)
-    }
-
-    # --- PacBio evidence ---
-    pb_ev <- rep(NA_real_, length(loci))
-    if (!is.null(omics_log$PacBio) && t %in% rownames(omics_log$PacBio)) {
-      thr   <- group_thr_pb(t, THRESH_PB)
-      mid   <- log1p(thr)
-      delta <- as.numeric(omics_log$PacBio[t, ]) - mid
-      pb_ev <- sigmoid01_delta(delta, s = s)
-    }
-
-    # --- ONT evidence: combined Leaf row or per-replicate ONT_CT* row ---
-    ont_ev <- rep(NA_real_, length(loci))
-    if (!is.null(omics_log$ONT)) {
-      if (t == "Leaf" && "Leaf" %in% rownames(omics_log$ONT)) {
-        # Combined leaf ONT: threshold = median of per-replicate thresholds
-        thr   <- group_thr_ont(median(as.numeric(THRESH_ONT_CT), na.rm = TRUE))
-        mid   <- log1p(thr)
-        delta <- as.numeric(omics_log$ONT["Leaf", ]) - mid
-        ont_ev <- sigmoid01_delta(delta, s = s)
-      } else if (grepl("^ONT_CT", t) && t %in% rownames(omics_log$ONT)) {
-        rep_name <- sub("^ONT_", "", t)   # "CT1", "CT2", or "CT3"
-        thr   <- group_thr_ont(THRESH_ONT_CT[[rep_name]])
-        mid   <- log1p(thr)
-        delta <- as.numeric(omics_log$ONT[t, ]) - mid
-        ont_ev <- sigmoid01_delta(delta, s = s)
-      }
-    }
-
-    # --- fuse (weighted mean, NA-safe per locus) ---
-    num <- rep(0, length(loci))
-    den <- rep(0, length(loci))
-
-    ok <- is.finite(ill_ev);  num[ok] <- num[ok] + w$Illumina * ill_ev[ok]; den[ok] <- den[ok] + w$Illumina
-    ok <- is.finite(pb_ev);   num[ok] <- num[ok] + w$PacBio   * pb_ev[ok];  den[ok] <- den[ok] + w$PacBio
-    ok <- is.finite(ont_ev);  num[ok] <- num[ok] + w$ONT      * ont_ev[ok]; den[ok] <- den[ok] + w$ONT
-
-    out <- rep(NA_real_, length(loci))
-    ok2 <- den > 0
-    out[ok2] <- num[ok2] / den[ok2]
-    butter[t, ] <- out
-  }
-
-  butter
+if (opt$validate) {
+  v <- validate_inputs(manifest, cfg, feats)
+  print_validation(v)
+  quit(status = if (v$ok) 0 else 1)
 }
 
-# ------------------------------------------------------------
-# RULE LABELS from tissue activity matrix
-# ------------------------------------------------------------
-label_loci_from_activity <- function(
-  butter,
-  chrom_support    = NULL,
-  dev_groups       = c("Embryo", "Endosperm", "Anther", "Pollen"),
-  veg_groups       = c("Leaf", "Root", "Ear", "Tassel"),
-  dom_margin       = 0.12,
-  min_facultative  = 2L
-) {
-  active_thr    <- 0.75
-  weak_thr      <- 0.45
-  silent_thr    <- 0.30
-  repress_thr   <- 0.35
-  const_frac    <- 0.50
-  dev_veg_gap   <- 0.12
-  veg_cap       <- 0.55
-  veg_dev_gap   <- 0.12
-  dev_cap       <- 0.55
-
-  loci        <- colnames(butter)
-  tissues_raw <- rownames(butter)
-
-  leaf_alias <- function(x) {
-    x <- as.character(x)
-    x[x %in% c("V11_Base", "V11_Middle", "V11_Tip")] <- "Leaf"
-    x[grepl("^ONT_CT", x)] <- "Leaf"
-    x
-  }
-  tissues_alias <- leaf_alias(tissues_raw)
-  alias_levels  <- unique(tissues_alias)
-
-  butter_alias <- sapply(alias_levels, function(tt) {
-    rows <- which(tissues_alias == tt)
-    if (length(rows) == 1L) return(butter[rows, ])
-    apply(butter[rows, , drop = FALSE], 2, max, na.rm = TRUE)
-  })
-  butter_alias <- t(butter_alias)
-  rownames(butter_alias) <- alias_levels
-  colnames(butter_alias) <- loci
-
-  dev_rows  <- intersect(dev_groups, rownames(butter_alias))
-  veg_rows  <- intersect(veg_groups, rownames(butter_alias))
-  dev_score <- if (length(dev_rows)) colMeans(butter_alias[dev_rows, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, length(loci))
-  veg_score <- if (length(veg_rows)) colMeans(butter_alias[veg_rows, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, length(loci))
-
-  top_tissue <- apply(butter_alias, 2, function(x) {
-    if (all(!is.finite(x))) return(NA_character_)
-    rownames(butter_alias)[which.max(x)]
-  })
-  top_score <- apply(butter_alias, 2, function(x) if (all(!is.finite(x))) NA_real_ else max(x, na.rm = TRUE))
-
-  margin <- apply(butter_alias, 2, function(x) {
-    x <- sort(x[is.finite(x)], decreasing = TRUE)
-    if (length(x) < 2) return(Inf)
-    x[1] - x[2]
-  })
-
-  breadth_active <- apply(butter_alias, 2, function(x) sum(x >= active_thr, na.rm = TRUE))
-  n_tis   <- nrow(butter_alias)
-  const_n <- max(3L, floor(n_tis * const_frac))
-
-  label <- rep("Background", length(loci))
-  label[is.finite(top_score) & top_score < silent_thr] <- "Silent"
-  idx_bg <- is.finite(top_score) & (top_score >= silent_thr) & (top_score < weak_thr)
-  label[idx_bg] <- "Background"
-
-  is_active <- is.finite(top_score) & (top_score >= active_thr)
-
-  if (!is.null(chrom_support)) {
-    cs  <- chrom_support[loci]
-    cs[!is.finite(cs)] <- 0
-    idx_rep <- (!is_active) & is.finite(top_score) & (top_score >= silent_thr) & (cs >= repress_thr)
-    label[idx_rep] <- "Repressed"
-  }
-
-  idx_const  <- is_active & (breadth_active >= const_n)
-  idx_single <- is_active & (breadth_active == 1L)
-  label[idx_const] <- "Constitutive"
-
-  idx_not_const_active <- is_active & !idx_const
-
-  idx_dev <- idx_not_const_active &
-    is.finite(dev_score) & is.finite(veg_score) &
-    ((dev_score - veg_score) >= dev_veg_gap) &
-    (veg_score <= veg_cap)
-
-  idx_veg <- idx_not_const_active &
-    is.finite(dev_score) & is.finite(veg_score) &
-    ((veg_score - dev_score) >= veg_dev_gap) &
-    (dev_score <= dev_cap)
-
-  label[idx_dev] <- "Developmental"
-  label[idx_veg] <- "Vegetative"
-
-  idx_fac <- is_active &
-    (breadth_active >= min_facultative) &
-    (breadth_active < const_n) &
-    !(idx_dev | idx_veg)
-  label[idx_fac] <- "Facultative"
-
-  idx_ts <- idx_single & (breadth_active == 1L) & (margin >= dom_margin)
-  label[idx_ts] <- paste0("Tissue-Specific:", top_tissue[idx_ts])
-
-  data.frame(
-    ID             = loci,
-    Activity       = label,
-    top_tissue     = top_tissue,
-    top_score      = top_score,
-    margin         = margin,
-    breadth_active = breadth_active,
-    dev_score      = dev_score,
-    veg_score      = veg_score,
-    stringsAsFactors = FALSE
-  )
+model <- build_model(manifest, feats, assay_columns = cfg$assay_columns)
+print(model)
+model <- filter_features(model, cfg$drop_contigs_regex)
+if ("Classification" %in% names(model$features)) {
+  cl <- model$features$Classification
+  model$features$Classification <- ifelse(is.na(cl), "Gene", cl)
 }
 
-# ------------------------------------------------------------
-# BUILD OMICS (on unified filtered subset) -> activity scores -> labels
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Thresholds and candidate filter
+# ---------------------------------------------------------------------------
+message("Estimating thresholds")
+thr <- compute_thresholds(model, cfg)
+keep <- Reduce(`|`, thr$pass) | thr$keep_chip | thr$keep_umr
+idx <- which(keep)
+message(length(idx), " of ", nrow(model$features), " features pass at least one platform or chromatin filter")
 
-mats <- build_omics_matrices(
-  decltr_res_df    = decltr_sub,
-  groups           = groups,
-  illumina_cols    = illumina_cols,
-  pb_expr_cols_all = pb_expr_cols_all,
-  chip_cols        = chip_cols,
-  umr_col          = umr_col
-)
+write.csv(thr$breakpoints, paste0(prefix, "_breakpoints.csv"), row.names = FALSE)
 
-butter <- compute_activity_scores_log(
-  omics_log       = mats$omics_log,
-  groups          = groups,
-  THRESH_ILLUMINA = THRESH_ILLUMINA,
-  THRESH_PB       = THRESH_PB,
-  THRESH_ONT_CT   = THRESH_ONT_CT,
-  s               = 0.25
-)
+# ---------------------------------------------------------------------------
+# Scores and labels
+# ---------------------------------------------------------------------------
+message("Scoring ", length(idx), " candidate features across ", length(thr$groups), " groups")
+mats <- build_omics_matrices(model, thr$groups, idx, thr$expr_platforms)
+butter <- compute_activity_scores_log(mats$omics_log, thr$groups, thr$group_thr,
+                                      cfg$scoring$weights, s = cfg$scoring$s, loci = mats$loci)
+chrom_support <- compute_chrom_support(thr, idx)
+names(chrom_support) <- mats$loci
+labels <- label_loci_from_activity(butter, chrom_support, aliases = cfg$aliases,
+                                   dev_groups = cfg$dev_groups, veg_groups = cfg$veg_groups,
+                                   lab = cfg$labels)
 
-labels <- label_loci_from_activity(
-  butter,
-  chrom_support = chrom_support,
-  dev_groups    = c("Embryo", "Endosperm", "Anther", "Pollen"),
-  veg_groups    = c("Leaf", "Root", "Ear", "Tassel")
-)
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+message("Writing output to ", prefix, ".*")
+wide <- model_to_wide(model, extras_fill = isTRUE(cfg$extras_fill))
+wide$Passed_Platforms <- passed_platforms_string(thr)
+wide <- merge(wide, labels, by = "ID", all.x = TRUE, sort = FALSE)
 
-decltr_labeled <- decltr_res_df %>%
-  dplyr::left_join(labels, by = "ID")
-
-qsave(decltr_labeled, "0427_samtools-Clip_Exon_Cleave_NAM_NewScoring_GeneLTR_Unif_PycFix_ONTsep.qs",
-  preset = "balanced"
-)
+qsave(wide, paste0(prefix, ".qs"), preset = "balanced")
+label_cols <- c("ID", "Chr", "Start", "End", "Strand", "Classification", "Passed_Platforms", names(labels)[-1])
+label_cols <- intersect(label_cols, names(wide))
+data.table::fwrite(wide[, label_cols], paste0(prefix, "_labels.tsv"), sep = "\t", na = "NA")
+file.copy(opt$manifest, paste0(prefix, "_manifest.tsv"), overwrite = TRUE)
+file.copy(opt$config, paste0(prefix, "_config.yml"), overwrite = TRUE)
+print(table(wide$Activity, useNA = "ifany"))
+message("Done.")
