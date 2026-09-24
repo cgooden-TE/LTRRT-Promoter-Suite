@@ -51,7 +51,9 @@ Fitting: EM over the TUs of each connected cluster. Reads whose 5' end lies in e
 of the cluster anchor that TU's abundance and shape; reads in several features are shared out.
 TSS usage, 3'-end histograms, splicing and junction terms are evaluated leave-one-out (a read never
 supports itself). S and f are re-estimated by Kaplan-Meier between passes, weighting each read as
-censored (full-length) or observed (truncated) by its EM probability of being initiated.
+censored (full-length) or observed (truncated) by its EM probability of being initiated. Clusters
+still moving after a few plain iterations are accelerated with SQUAREM (SqS3), which extrapolates
+the per-read state along the last two steps and keeps the jump only if the map's residual shrinks.
 
 Outputs, per read: posterior over candidate TUs, and the probability that its 5' end is a TSS of
 the assigned TU (rather than a truncation). Per TU: expected reads, expected TSS-initiated reads,
@@ -82,8 +84,12 @@ class EMParams:
     far_penalty: float = 1e-3       # extra factor for 3' ends beyond the read-out region
     base_3p: tuple = (0.6, 0.2, 0.2)   # base 3'-end mass: termination zone, body, read-out
     junc_tol: int = 5               # bp tolerance for matching annotated introns / pooling junctions
-    max_iter: int = 500
+    max_iter: int = 500             # cap on E-steps (map evaluations), SQUAREM steps included
     tol: float = 1e-3               # stop when no TU's expected read count moves more than this
+    accel: str = 'squarem'          # 'squarem' extrapolates the fixed-point map; 'none' is plain EM
+    accel_warmup: int = 5           # plain E-steps before extrapolating; most clusters finish first
+    accel_step_max0: float = 1.0    # SQUAREM step-length bounds (Varadhan & Roland 2008, SqS3)
+    accel_mstep: float = 4.0
     trunc_min_sample: int = 2000    # a BAM needs this many reads for its own survival fit
     trunc_passes: int = 2           # EM passes; S and f are re-fitted (Kaplan-Meier) between passes
     eps_unknown_tss: float = 0.05   # share of a unit's reads allowed to start from an uncalled TSS
@@ -600,7 +606,7 @@ def em_cluster(units, records, p, trunc):
            for pr, g in zip(r[4], gs)] for r, gs in zip(R, G)]
     RESP = [[tuple(1.0 / len(pr[0]) for _ in pr[0]) if pr[0] else () for pr in r[4]] for r in R]
 
-    def m_step():
+    def m_step(G, GI, RESP):
         S = {'N': [0.0] * n_u, 'I': [0.0] * n_u, 'Intr': [0.0] * n_u, 'Sp': [0.0] * n_u,
              'JC': [0.0] * n_u, 'M3': [0.0] * n_u, 'W': [0.0] * n_u,
              'C3': [[0.0, 0.0, 0.0] for _ in range(n_u)],
@@ -727,9 +733,7 @@ def em_cluster(units, records, p, trunc):
         ll += math.log(max(S['N'][j] - g, 0.0) + p.alpha_prior)
         return ll, frac, new_resp
 
-    S = m_step()
-    n_iter = 0
-    for n_iter in range(1, p.max_iter + 1):
+    def e_step(G, GI, RESP, S):
         newG, newGI, newR = [], [], []
         for (origin, endpos, spliced, ci, pairs), gs, gis, rs in zip(R, G, GI, RESP):
             if len(ci) == 1:
@@ -752,12 +756,105 @@ def em_cluster(units, records, p, trunc):
             newG.append(post)
             newGI.append([pp * fi for pp, fi in zip(post, fis)])
             newR.append(rrs)
-        G, GI, RESP = newG, newGI, newR
-        S_new = m_step()
-        delta = max(abs(a - b) for a, b in zip(S_new['N'], S['N'])) if n_u else 0.0
-        S = S_new
-        if delta < p.tol:
-            break
+        return newG, newGI, newR
+
+    def n_delta(Sa, Sb):
+        return max(abs(a - b) for a, b in zip(Sa['N'], Sb['N'])) if n_u else 0.0
+
+    def extrapolate(s0, s1, s2, step_max):
+        """SqS3 step on the per-read state: x0 + 2a*r + a^2*v, r = x1 - x0, v = x2 - 2*x1 + x0,
+        a = |r|/|v| bounded to [1, step_max] (a = 1 gives back x2). The result is projected back
+        onto valid posteriors: each read's G on the simplex, GI within [0, G], peak
+        responsibilities non-negative and summing to at most 1."""
+        sr = sv = 0.0
+        for c in range(3):
+            for r0, r1, r2 in zip(s0[c], s1[c], s2[c]):
+                for a0, a1, a2 in zip(r0, r1, r2):
+                    if c == 2:
+                        for b0, b1, b2 in zip(a0, a1, a2):
+                            sr += (b1 - b0) ** 2
+                            sv += (b2 - 2 * b1 + b0) ** 2
+                    else:
+                        sr += (a1 - a0) ** 2
+                        sv += (a2 - 2 * a1 + a0) ** 2
+        if sv <= 0.0 or sr <= 0.0:
+            return None, 1.0
+        a = min(max(math.sqrt(sr / sv), 1.0), step_max)
+        c1, c2 = 2.0 * a, a * a
+
+        def ext(x0, x1, x2):
+            return x0 + c1 * (x1 - x0) + c2 * (x2 - 2 * x1 + x0)
+
+        G, GI, RESP = [], [], []
+        for g0, g1, g2, i0, i1, i2, q0, q1, q2 in zip(s0[0], s1[0], s2[0], s0[1], s1[1], s2[1],
+                                                      s0[2], s1[2], s2[2]):
+            if len(g0) == 1:
+                g = [1.0]
+            else:
+                g = [min(max(ext(x0, x1, x2), 0.0), 1.0) for x0, x1, x2 in zip(g0, g1, g2)]
+                z = sum(g)
+                g = [x / z for x in g] if z > 0 else [1.0 / len(g)] * len(g)
+            gi = [min(max(ext(x0, x1, x2), 0.0), gg) for x0, x1, x2, gg in zip(i0, i1, i2, g)]
+            rs = []
+            for p0, p1, p2 in zip(q0, q1, q2):
+                rr = [min(max(ext(x0, x1, x2), 0.0), 1.0) for x0, x1, x2 in zip(p0, p1, p2)]
+                z = sum(rr)
+                rs.append(tuple(x / z for x in rr) if z > 1.0 else tuple(rr))
+            G.append(g)
+            GI.append(gi)
+            RESP.append(rs)
+        return (G, GI, RESP), a
+
+    state = (G, GI, RESP)
+    S = m_step(*state)
+    n_iter = 0
+    step_max = p.accel_step_max0
+    while n_iter < p.max_iter:
+        s1 = e_step(*state, S)
+        S1 = m_step(*s1)
+        n_iter += 1
+        d1 = n_delta(S1, S)
+        if d1 < p.tol or p.accel != 'squarem' or n_iter < p.accel_warmup \
+                or n_iter >= p.max_iter:
+            state, S = s1, S1
+            if d1 < p.tol:
+                break
+            continue
+        # SQUAREM cycle: two map evaluations, an extrapolated jump, and a stabilising map step.
+        # The map (leave-one-out E-step + M-step) has no objective to check a jump against, so the
+        # merit is its residual: a jump is kept only if the step taken from it moves N less than
+        # the first plain step of the cycle did; otherwise the cycle falls back to x2.
+        s2 = e_step(*s1, S1)
+        S2 = m_step(*s2)
+        n_iter += 1
+        d2 = n_delta(S2, S1)
+        if d2 < p.tol or n_iter >= p.max_iter:
+            state, S = s2, S2
+            if d2 < p.tol:
+                break
+            continue
+        sx, a = extrapolate(state, s1, s2, step_max)
+        if sx is None or a <= 1.0:
+            # a = 1 is the plain step x2; at the bound, allow a longer jump next cycle
+            state, S = s2, S2
+            if sx is not None and a >= step_max:
+                step_max *= p.accel_mstep
+            continue
+        Sx = m_step(*sx)
+        s4 = e_step(*sx, Sx)
+        S4 = m_step(*s4)
+        n_iter += 1
+        d4 = n_delta(S4, Sx)
+        if math.isfinite(d4) and d4 <= d1:
+            state, S = s4, S4
+            if a >= step_max:
+                step_max *= p.accel_mstep
+            if d4 < p.tol:
+                break
+        else:
+            state, S = s2, S2
+            step_max = max(p.accel_step_max0, step_max / p.accel_mstep)
+    G, GI, RESP = state
 
     per_record = [[(keys[j], g, gi) for j, g, gi in zip(r[3], gs, gis)]
                   for r, gs, gis in zip(R, G, GI)]

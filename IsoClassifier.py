@@ -280,6 +280,10 @@ def parse_args():
     parser.add_argument('--em-tol', dest='em_tol', type=float, default=1e-3,
                         help='EM: stop when no unit\'s expected read count changes by more than '
                              'this (default: 0.001)')
+    parser.add_argument('--em-accel', dest='em_accel', choices=('squarem', 'none'),
+                        default='squarem',
+                        help='EM: squarem (default) extrapolates slow-converging clusters (SQUAREM, '
+                             'SqS3); none runs plain EM iterations')
     parser.add_argument('--tss-method', dest='tss_method', choices=('consensus', 'mode'),
                         default='consensus',
                         help='consensus (default): library-balanced call -- each library\'s share '
@@ -1273,7 +1277,8 @@ def em_assign_deferred(feat_info, body_tree, deferred, anchors, stats, tss_count
                            junc_init_frac=args.em_junc_init_frac,
                            readout_bp=args.em_readout_bp,
                            gene_promoter_bp=args.em_gene_promoter_bp,
-                           junc_tol=5, max_iter=args.em_max_iter, tol=args.em_tol)
+                           junc_tol=5, max_iter=args.em_max_iter, tol=args.em_tol,
+                           accel=args.em_accel)
 
     records = [(d.origin, d.endpos, d.has_intron, d.juncs,
                 tuple((fid, orient) for fid, orient, _k, _c in d.cands), d.alen, d.sample)
