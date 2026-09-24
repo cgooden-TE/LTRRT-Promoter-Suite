@@ -67,7 +67,14 @@ def extract_pychopper_tags(pychopped, out):
     if not pychopped:
         print("[INFO] No PyChopper FASTQ provided; skipping tag extraction.")
         return False
-    command = f"grep \"^@\" {pychopped} | awk -F '[ =]' '{{print $1 \"\\t\" $3}}' | sed 's/^@//' > {out}"
+    # Read only header lines (every 4th) and locate the strand= field by name, since
+    # SRA-derived FASTQs carry an extra field between the read name and strand=.
+    awk_prog = (
+        'NR%4==1 {name=substr($1,2); s=""; '
+        'for(i=2;i<=NF;i++) if($i ~ /^strand=/) s=substr($i,8); '
+        'if(s!="") print name "\\t" s}'
+    )
+    command = f"awk '{awk_prog}' {pychopped} > {out}"
     run_command(command, f"{out}.log", step_name="Extract PyChopper Tags", sample_name=os.path.basename(pychopped))
     return True
 
@@ -211,20 +218,31 @@ def run_cutadapt(fq_in, fq_out, log, a="A{15}", g="T{15}", t=16):
     run_command(command, log, step_name="Cutadapt", sample_name=os.path.basename(fq_in))
 
 ## Minimap2 alignment with default settings unless specified by the user
-def run_minimap2(ref, fq, bam_out, log, t=24, sec="no", gap=20000, preset="splice"):
+def run_minimap2(ref, fq, bam_out, log, t=24, sec="no", gap=20000, preset="splice",
+                 u="auto"):
     # Build the preset/flags portion of the command
     if preset == "none":
         # No preset: user takes full control via other flags
         ax_flags = "-a"
+        preset_u = None
     elif preset == "splice:hq":
-        # PacBio IsoSeq / HiFi reads
+        # PacBio IsoSeq / HiFi reads. minimap2 leaves -u at its own default of 'n'
+        # for this preset, so junctions are placed without GT-AG guidance unless
+        # the caller asks for it.
         ax_flags = "-ax splice:hq"
+        preset_u = None
     else:
         # ONT cDNA/dRNA default.
-        # -ub (not -uf): let minimap2 test splice motifs on both strands. -uf forces
-        # a forward-only splice model, which makes its 'ts'/'jM' strand calls a
-        # constant '+' instead of an independent signal -- see infer_strand() below.
-        ax_flags = f"-ax {preset} -ub -k14"
+        ax_flags = f"-ax {preset} -k14"
+        preset_u = "b"
+
+    # -u controls the GT-AG search: f=transcript strand, b=both strands, n=off.
+    # -ub (not -uf): let minimap2 test splice motifs on both strands. -uf forces
+    # a forward-only splice model, which makes its 'ts'/'jM' strand calls a
+    # constant '+' instead of an independent signal -- see infer_strand() below.
+    u_flag = preset_u if u == "auto" else (None if u == "off" else u)
+    if u_flag:
+        ax_flags += f" -u{u_flag}"
 
     command = (
         f"minimap2 {ax_flags} --secondary={sec} -G {gap} -t {t} {ref} {fq}"
@@ -236,8 +254,12 @@ def run_minimap2(ref, fq, bam_out, log, t=24, sec="no", gap=20000, preset="splic
     run_command(idx_command, log, step_name="Index BAM", sample_name=os.path.basename(fq))
 
 ## Pychopper primer removal with default (multiplex) settings unless specified by the user
-def run_pychopper(fq_in, fq_out, unc, resc, report, log, kit="PCB114", t=8):
-    command = f"pychopper -k {kit} -t {t} -r {report} -u {unc} -w {resc} {fq_in} {fq_out}"
+def run_pychopper(fq_in, fq_out, unc, resc, report, log, kit="PCB114", t=8, min_qual=7.0):
+    # min_qual mirrors PyChopper's -Q. Reads deposited with placeholder quality strings
+    # score below the default 7.0, which empties the autotune sample and aborts the run;
+    # lower it to 0 for those, since primer detection is alignment-based and ignores QVs.
+    command = (f"pychopper -k {kit} -t {t} -Q {min_qual} -r {report}"
+               f" -u {unc} -w {resc} {fq_in} {fq_out}")
     run_command(command, log, step_name="PyChopper", sample_name=os.path.basename(fq_in))
 
 if __name__ == "__main__":
@@ -252,6 +274,9 @@ if __name__ == "__main__":
     parser.add_argument("--ref", help="Reference genome")
     parser.add_argument("--kit", default="PCB114")
     parser.add_argument("--pyc_threads", type=int, default=8)
+    parser.add_argument("--pyc_min_qual", type=float, default=7.0,
+                        help="PyChopper minimum mean read quality (-Q). Use 0 for runs "
+                             "deposited with placeholder quality strings.")
     parser.add_argument("--cut_threads", type=int, default=16)
     parser.add_argument("--map_threads", type=int, default=24)
     parser.add_argument("--map_preset", default="splice",
@@ -259,6 +284,12 @@ if __name__ == "__main__":
                         help="Minimap2 preset: 'splice' for ONT (default), "
                              "'splice:hq' for PacBio IsoSeq/HiFi, "
                              "'none' to omit preset")
+    parser.add_argument("--map_u", default="auto", choices=["auto", "f", "b", "n", "off"],
+                        help="minimap2 -u (GT-AG search): 'b' both strands, "
+                             "'f' transcript strand, 'n' no GT-AG matching, "
+                             "'off' omit the flag entirely. Default 'auto' keeps "
+                             "each preset's historical behaviour ('b' for splice, "
+                             "omitted for splice:hq).")
     parser.add_argument("--map_sec", default="no")
     parser.add_argument("--map_gap", type=int, default=5000)
     args = parser.parse_args()
@@ -271,7 +302,8 @@ if __name__ == "__main__":
         rpt = f"{args.sample}.pychopper.report.pdf"
         log = f"{args.sample}.pychopper.log"
         resc = f"{args.sample}pychopper.rescued.fastq"
-        run_pychopper(current_fq, pyc_out, unc, resc, rpt, log, kit=args.kit, t=args.pyc_threads)
+        run_pychopper(current_fq, pyc_out, unc, resc, rpt, log, kit=args.kit,
+                      t=args.pyc_threads, min_qual=args.pyc_min_qual)
         args.pyc = pyc_out
         current_fq = pyc_out
 
@@ -285,7 +317,8 @@ if __name__ == "__main__":
         bam_out = f"{args.sample}.minimap2.sorted.bam"
         log = f"{args.sample}.minimap2.log"
         run_minimap2(args.ref, current_fq, bam_out, log, t=args.map_threads,
-                     sec=args.map_sec, gap=args.map_gap, preset=args.map_preset)
+                     sec=args.map_sec, gap=args.map_gap, preset=args.map_preset,
+                     u=args.map_u)
         args.bam = bam_out
 
     if args.run_pyc:
